@@ -87,15 +87,6 @@ class ScanThread(QThread):
         self.done.emit(repos)
 
 
-class VerifyThread(QThread):
-    """后台执行系统身份验证（UserConsentVerifier 是阻塞调用）。"""
-
-    done = Signal(object)   # verify.VerifyResult
-
-    def run(self):
-        self.done.emit(verify.request_verification("GiTool：请验证身份以继续推送"))
-
-
 class PillButton(QWidget):
     """面板内的胶囊文字按钮。"""
 
@@ -792,7 +783,13 @@ class RepoPage(QWidget):
         self._root: Path | None = None
         self._repos: list[RepoInfo] = []
         self._scan_thread: ScanThread | None = None
-        self._verify_thread: VerifyThread | None = None
+        self._verify_session = None
+        self._verify_remote: RemoteBranch | None = None
+        self._verify_timer: QTimer | None = None
+        self._prompt_known: set[int] = set()
+        self._focus_timer: QTimer | None = None
+        self._focus_tries = 0
+        self._guard_on = False
         self._proc: QProcess | None = None
         self._detail: DetailPanel | None = None
         self._detail_anim: QVariantAnimation | None = None
@@ -1153,14 +1150,93 @@ class RepoPage(QWidget):
         detail.set_busy(True)
         detail.set_status("正在等待系统身份验证…", "busy")
 
-        thread = VerifyThread(self)
-        thread.done.connect(lambda result: self._after_verify(remote, result))
-        thread.finished.connect(thread.deleteLater)
-        self._verify_thread = thread
-        thread.start()
+        window = self.window()
+        self._prompt_known = verify.prompt_windows()
+        self._verify_remote = remote
+        result, session = verify.start_verification(
+            "GiTool：请验证身份以继续推送", int(window.winId()))
+        if result is not None:
+            self._after_verify(remote, result)
+            return
+        self._verify_session = session
+
+        timer = QTimer(self)
+        timer.setInterval(50)
+        timer.timeout.connect(self._poll_verify)
+        timer.start()
+        self._verify_timer = timer
+
+        self._focus_tries = 0
+        timer = QTimer(self)
+        timer.setInterval(200)
+        timer.timeout.connect(self._focus_prompt)
+        timer.start()
+        self._focus_timer = timer
+
+    def _focus_prompt(self):
+        """验证对话框出现后把它切到前台，并把主窗口一起置顶。"""
+        self._focus_tries += 1
+        fresh = verify.prompt_windows() - self._prompt_known
+        for hwnd in fresh:
+            if verify.activate_prompt(hwnd, int(self.window().winId())):
+                self._guard_on = True
+                self._stop_focus_timer()
+                return
+        if self._focus_tries >= 6:
+            self._stop_focus_timer()
+
+    def _poll_verify(self):
+        session = self._verify_session
+        if session is None:
+            self._stop_verify_timer()
+            return
+        try:
+            if session.status() == 0:
+                return
+            result = session.finish()
+        except Exception as exc:
+            result = verify.VerifyResult(False, "error", f"验证调用失败：{exc}")
+        self._verify_session = None
+        self._stop_verify_timer()
+        self._restore_focus()
+        QTimer.singleShot(200, lambda: self._restore_focus(True))
+        QTimer.singleShot(600, lambda: self._restore_focus(True))
+        QTimer.singleShot(1500, lambda: self._restore_focus(True, True))
+        remote = self._verify_remote
+        self._verify_remote = None
+        if remote is not None:
+            self._after_verify(remote, result)
+
+    def _restore_focus(self, release: bool = False, force: bool = False):
+        """验证结束把键盘焦点交回主窗口，稍后再撤销验证期间的置顶。
+
+        置顶要等对话框真正消失、主窗口回到前台之后才撤销：提前撤销会让系统刚
+        激活的其它窗口露到主窗口前面，那就是用户看到的"闪一下"。force 只作兜底，
+        避免极端情况下主窗口一直置顶。
+        """
+        hwnd = int(self.window().winId())
+        if verify.foreground_window() != hwnd:
+            verify.activate_window(hwnd)
+        if not self._guard_on:
+            return
+        if force or (release and verify.foreground_window() == hwnd):
+            self._guard_on = False
+            verify.set_topmost(hwnd, False)
+
+    def _stop_verify_timer(self):
+        if self._verify_timer is not None:
+            self._verify_timer.stop()
+            self._verify_timer.deleteLater()
+            self._verify_timer = None
+
+    def _stop_focus_timer(self):
+        if self._focus_timer is not None:
+            self._focus_timer.stop()
+            self._focus_timer.deleteLater()
+            self._focus_timer = None
 
     def _after_verify(self, remote: RemoteBranch, result):
-        self._verify_thread = None
+        self._stop_focus_timer()
         detail = self._detail
         if detail is None:
             return
@@ -1233,9 +1309,15 @@ class RepoPage(QWidget):
 
     def shutdown(self):
         """窗口关闭前等待后台线程结束，避免 QThread 销毁告警。"""
-        for thread in (self._scan_thread, self._verify_thread):
-            if thread is not None and thread.isRunning():
-                thread.wait(3000)
+        if self._guard_on:
+            self._guard_on = False
+            verify.set_topmost(int(self.window().winId()), False)
+        if self._verify_session is not None:
+            self._verify_session.release()
+            self._verify_session = None
+        thread = self._scan_thread
+        if thread is not None and thread.isRunning():
+            thread.wait(3000)
 
 
 def _brief_error(text: str) -> str:
