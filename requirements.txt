@@ -1,0 +1,3 @@
+PySide6
+winrt-runtime>=4.1.0
+winrt-Windows.Security.Credentials.UI>=10.0.28000.2957
