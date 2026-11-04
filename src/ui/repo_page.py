@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import zlib
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -42,6 +43,21 @@ _BAR_H = 46
 def _row_height(repo: RepoInfo) -> int:
     """条目（以及原位展开的详情卡）的固定高度：随远程数量增长。"""
     return 84 + 19 * max(1, len(repo.remotes))
+
+
+def _pushable(repo: RepoInfo) -> bool:
+    """能否直接推送：有可推送的远程，且不在 detached 状态。"""
+    return bool(repo.pushable_remotes) and not repo.detached
+
+
+def _repo_order(repo: RepoInfo) -> tuple[int, str, str]:
+    """可推送的条目置顶，组内按名称首字母（不区分大小写）排序。"""
+    return (0 if _pushable(repo) else 1, repo.name.casefold(), str(repo.path).casefold())
+
+
+def _avatar_index(name: str) -> int:
+    """头像底色下标：用 crc32 而非 hash()，保证每次启动取到同一个颜色。"""
+    return zlib.crc32(name.encode("utf-8")) % len(_AVATAR_COLORS)
 
 
 def _is_dark(widget: QWidget) -> bool:
@@ -207,7 +223,7 @@ class RepoRow(QWidget):
             self._icon = QIcon(str(icon_path))
 
         self.arrow = ArrowButton(self)
-        self.arrow.setVisible(bool(repo.pushable_remotes) and not repo.detached)
+        self.arrow.setVisible(_pushable(repo))
         self.arrow.clicked.connect(lambda: self.open_requested.emit(self.repo, self))
 
     def resizeEvent(self, e):
@@ -311,7 +327,7 @@ class RepoRow(QWidget):
         if self._icon is not None:
             p.drawPixmap(rect, self._icon.pixmap(QSize(40, 40)))
         else:
-            color = QColor(_AVATAR_COLORS[hash(self.repo.name) % len(_AVATAR_COLORS)])
+            color = QColor(_AVATAR_COLORS[_avatar_index(self.repo.name)])
             p.fillRect(rect, color)
             f = QFont(self.font())
             f.setPointSize(15)
@@ -807,12 +823,16 @@ class RepoPage(QWidget):
         self.choose_btn = PillButton("选择目录", self)
         self.choose_btn.clicked.connect(self._choose_dir)
 
+        self.refresh_btn = PillButton("刷新", self)
+        self.refresh_btn.clicked.connect(self._refresh)
+        self.refresh_btn.set_accept(self._root is not None)
+
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # 隐藏纵向滚动条占位，让条目/按钮右边缘直达面板边缘（滚轮仍可滚动）
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 纵向滚动条按需显示（内容超出时出现），样式在 apply_style 里定义
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.scroll.viewport().setAutoFillBackground(False)
 
         self.empty = EmptyState(self)
@@ -838,6 +858,8 @@ class RepoPage(QWidget):
         panel = self._panel_rect()
         self.choose_btn.move(panel.right() - self.choose_btn.width() - 14,
                              panel.top() + 7)
+        self.refresh_btn.move(self.choose_btn.x() - self.refresh_btn.width() - 8,
+                              self.choose_btn.y())
         body = QRect(panel.left() + 1, panel.top() + _BAR_H,
                      panel.width() - 2, panel.height() - _BAR_H - 1)
         self.scroll.setGeometry(body)
@@ -857,7 +879,7 @@ class RepoPage(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "仓库")
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "推送")
 
         f.setPointSize(_SUB_PT)
         f.setBold(False)
@@ -884,9 +906,9 @@ class RepoPage(QWidget):
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(panel.left() + 18, panel.top() + 5,
-                          panel.width() - 150, _BAR_H - 10),
+                          panel.width() - 272, _BAR_H - 10),
                    Qt.AlignVCenter | Qt.AlignLeft,
-                   _elide(p, root_text, panel.width() - 150))
+                   _elide(p, root_text, panel.width() - 272))
 
         p.setPen(theme.st("panel_border", dark))
         p.drawLine(panel.left() + 1, panel.top() + _BAR_H,
@@ -928,6 +950,14 @@ class RepoPage(QWidget):
     def _is_scanning(self) -> bool:
         return self._scan_thread is not None and self._scan_thread.isRunning()
 
+    def _refresh(self):
+        """重新扫描当前目录；扫描中或验证/推送过程中不打断。"""
+        if self._root is None or self._is_scanning():
+            return
+        if self._detail is not None and self._detail.busy:
+            return
+        self._start_scan()
+
     def _start_scan(self):
         self._close_detail(instant=True)
         self._repos = []
@@ -939,6 +969,7 @@ class RepoPage(QWidget):
         self.empty.show()
         self.scroll.hide()
         self.choose_btn.set_accept(False)
+        self.refresh_btn.set_accept(False)
         self._phase_timer.start()
 
         thread = ScanThread(self._root, self)
@@ -952,7 +983,8 @@ class RepoPage(QWidget):
         self._scan_thread = None
         self._phase_timer.stop()
         self.choose_btn.set_accept(True)
-        self._repos = repos
+        self.refresh_btn.set_accept(self._root is not None)
+        self._repos = sorted(repos, key=_repo_order)
         self._rebuild_rows()
 
         if repos:
@@ -999,7 +1031,12 @@ class RepoPage(QWidget):
             self._repos = [r for r in self._repos if r.path != path]
         else:
             self._repos = [info if r.path == path else r for r in self._repos]
+        self._repos.sort(key=_repo_order)
+        # 重建列表会换掉滚动区里的控件，滚动位置随之归零；刷新后要停在原处
+        bar = self.scroll.verticalScrollBar()
+        offset = bar.value()
         self._rebuild_rows()
+        bar.setValue(offset)
 
     # ---------- 详情 ----------
     def _open_detail(self, repo: RepoInfo, row: RepoRow):

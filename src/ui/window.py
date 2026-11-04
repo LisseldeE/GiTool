@@ -516,7 +516,7 @@ class Sidebar(QWidget):
         lay.addItem(self._sec_bot)
 
         self.nav_items = []
-        for key, label, ip in [("repos", "仓库", "grid"),
+        for key, label, ip in [("repos", "推送", "grid"),
                                ("settings", "设置", "gear")]:
             nb = NavButton(key, label, ip)
             nb.clicked_signal.connect(self.navigate_signal)
