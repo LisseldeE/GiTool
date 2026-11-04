@@ -10,16 +10,16 @@ import zlib
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve, QLineF, QPointF, QProcess, QRect, QRectF, QSize, Qt, QThread,
-    QTimer, QVariantAnimation, Signal,
+    QEasingCurve, QLineF, QObject, QPointF, QProcess, QRect, QRectF, QSize, Qt,
+    QThread, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter,
-    QPainterPath, QPalette, QShortcut,
+    QPainterPath, QPalette, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QScrollArea,
-    QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from ..core import gitrepo, store, theme, verify
@@ -86,18 +86,121 @@ def _gap_text(rb: RemoteBranch) -> tuple[str, QColor]:
     return "已同步", QColor()
 
 
+def _norm(path: str) -> str:
+    return str(Path(path)).lower()
+
+
+def add_source(path: str, kind: str) -> bool:
+    """登记仓库来源（同路径同类型只保留一份）；返回是否新增。"""
+    items = store.repo_sources()
+    if any(_norm(i["path"]) == _norm(path) and i["kind"] == kind for i in items):
+        return False
+    items.append({"path": str(Path(path)), "kind": kind})
+    store.save_repo_sources(items)
+    return True
+
+
+def remove_source(path: str, kind: str) -> None:
+    items = [i for i in store.repo_sources()
+             if not (_norm(i["path"]) == _norm(path) and i["kind"] == kind)]
+    store.save_repo_sources(items)
+
+
+def sources_signature(items: list[dict] | None = None) -> tuple:
+    """来源列表指纹：用于判断「仓库」页里的增删，决定是否需要重新扫描。"""
+    items = store.repo_sources() if items is None else items
+    return tuple((i["path"], i["kind"]) for i in items)
+
+
+def stop_thread(thread: QThread | None) -> None:
+    """退出前收敛后台扫描线程：先等，仍未结束则中断/终止，避免 QThread 在运行中被销毁。"""
+    if thread is None or not thread.isRunning():
+        return
+    thread.wait(5000)
+    if thread.isRunning():
+        thread.requestInterruption()
+        thread.wait(2000)
+    if thread.isRunning():
+        thread.terminate()
+        thread.wait(1000)
+
+
+class ScanService(QObject):
+    """全局仓库扫描：首页与推送页共用同一份结果，来源未变时不重复跑 git。"""
+
+    started = Signal()
+    finished = Signal(object)   # list[RepoInfo]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread: ScanThread | None = None
+        self._sig: tuple | None = None
+        self._sources: list[dict] = []
+        self._repos: list[RepoInfo] = []
+
+    def sources(self) -> list[dict]:
+        return self._sources
+
+    def repos(self) -> list[RepoInfo]:
+        return self._repos
+
+    def scanning(self) -> bool:
+        return self._thread is not None and self._thread.isRunning()
+
+    def ensure(self, force: bool = False) -> bool:
+        """来源与上次一致时直接复用缓存并返回 True；否则启动一次扫描并返回 False。"""
+        if self.scanning():
+            return False
+        sources = store.repo_sources()
+        sig = sources_signature(sources)
+        if not force and sig == self._sig:
+            return True
+        self._sources = sources
+        self._sig = sig
+        if not sources:
+            self._repos = []
+            return True
+        thread = ScanThread(sources, self)
+        thread.done.connect(self._on_done)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self.started.emit()
+        thread.start()
+        return False
+
+    def _on_done(self, repos: list):
+        self._thread = None
+        self._repos = repos
+        self.finished.emit(repos)
+
+    def shutdown(self):
+        thread = self._thread
+        stop_thread(thread)
+        self._thread = None
+
+
+_service: ScanService | None = None
+
+
+def scan_service() -> ScanService:
+    global _service
+    if _service is None:
+        _service = ScanService()
+    return _service
+
+
 class ScanThread(QThread):
-    """后台扫描目录，避免大目录阻塞界面。"""
+    """后台扫描仓库来源，避免大目录阻塞界面。"""
 
     done = Signal(object)   # list[RepoInfo]
 
-    def __init__(self, root: Path, parent=None):
+    def __init__(self, sources: list[dict], parent=None):
         super().__init__(parent)
-        self.root = root
+        self.sources = list(sources)
 
     def run(self):
         try:
-            repos = gitrepo.scan(self.root)
+            repos = gitrepo.scan_sources(self.sources)
         except Exception:
             repos = []
         self.done.emit(repos)
@@ -377,12 +480,12 @@ def _text_width(font: QFont, text: str) -> int:
 class EmptyState(QWidget):
     """列表为空/扫描中的居中提示。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, btn_text: str = "选择目录"):
         super().__init__(parent)
         self.title = "还没有仓库"
         self.subtitle = "选择一个目录，扫描其中所有 Git 仓库"
         self.scanning = False
-        self.btn = PillButton("选择目录", self)
+        self.btn = PillButton(btn_text, self)
 
     def set_text(self, title: str, subtitle: str):
         self.title, self.subtitle = title, subtitle
@@ -796,11 +899,11 @@ class RepoPage(QWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
 
-        self._root: Path | None = None
+        self._sources: list[dict] = []
+        self._scan_sig: tuple = ()
         self._repos: list[RepoInfo] = []
-        self._scan_thread: ScanThread | None = None
         self._verify_session = None
-        self._verify_remote: RemoteBranch | None = None
+        self._verify_callback = None
         self._verify_timer: QTimer | None = None
         self._prompt_known: set[int] = set()
         self._focus_timer: QTimer | None = None
@@ -814,18 +917,17 @@ class RepoPage(QWidget):
         self._holder: QWidget | None = None
         self._layout: QVBoxLayout | None = None
 
-        # 恢复上次扫描目录：目录仍存在则等页面首次显示时自动扫描
-        saved_root = store.get("last_scan_root")
-        if isinstance(saved_root, str) and Path(saved_root).is_dir():
-            self._root = Path(saved_root)
-        self._restore_pending = self._root is not None
-
-        self.choose_btn = PillButton("选择目录", self)
-        self.choose_btn.clicked.connect(self._choose_dir)
+        # 仓库来源由「仓库」页维护；旧版只有一个扫描目录，首次运行时迁入来源列表
+        self._sources = store.repo_sources()
+        if not self._sources:
+            legacy = store.get("last_scan_root")
+            if isinstance(legacy, str) and Path(legacy).is_dir():
+                self._sources = [{"path": legacy, "kind": "folder"}]
+                store.save_repo_sources(self._sources)
 
         self.refresh_btn = PillButton("刷新", self)
         self.refresh_btn.clicked.connect(self._refresh)
-        self.refresh_btn.set_accept(self._root is not None)
+        self.refresh_btn.set_accept(bool(self._sources))
 
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
@@ -836,7 +938,7 @@ class RepoPage(QWidget):
         self.scroll.viewport().setAutoFillBackground(False)
 
         self.empty = EmptyState(self)
-        self.empty.btn.clicked.connect(self._choose_dir)
+        self.empty.btn.hide()   # 目录在「仓库」页添加，这里不给快捷入口
 
         self._esc = QShortcut(QKeySequence("Escape"), self)
         self._esc.setContext(Qt.WindowShortcut)
@@ -845,6 +947,9 @@ class RepoPage(QWidget):
         self._phase_timer = QTimer(self)
         self._phase_timer.setInterval(80)
         self._phase_timer.timeout.connect(self._empty_tick)
+
+        # 扫描结果由全局服务统一提供，首页与推送页共用同一次扫描
+        scan_service().finished.connect(self._on_scan_finished)
 
         self.apply_style()
 
@@ -856,10 +961,8 @@ class RepoPage(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         panel = self._panel_rect()
-        self.choose_btn.move(panel.right() - self.choose_btn.width() - 14,
-                             panel.top() + 7)
-        self.refresh_btn.move(self.choose_btn.x() - self.refresh_btn.width() - 8,
-                              self.choose_btn.y())
+        self.refresh_btn.move(panel.right() - self.refresh_btn.width() - 14,
+                              panel.top() + 7)
         body = QRect(panel.left() + 1, panel.top() + _BAR_H,
                      panel.width() - 2, panel.height() - _BAR_H - 1)
         self.scroll.setGeometry(body)
@@ -886,7 +989,7 @@ class RepoPage(QWidget):
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
-                   "选择目录后扫描其中的 Git 仓库，推送前需要系统身份验证")
+                   "汇总「仓库」页登记的所有来源，推送前需要系统身份验证")
 
         panel = self._panel_rect()
         r = theme.st("panel_radius", dark)
@@ -894,13 +997,13 @@ class RepoPage(QWidget):
         p.setBrush(theme.st("panel_bg", dark))
         p.drawRoundedRect(QRectF(panel).adjusted(0.5, 0.5, -0.5, -0.5), r, r)
 
-        # 面板顶栏：当前目录 / 扫描状态
+        # 面板顶栏：来源数量与仓库总数 / 扫描状态
         if self._is_scanning():
             root_text = "正在扫描目录…"
-        elif self._root is not None:
-            root_text = str(self._root)
+        elif self._sources:
+            root_text = f"{len(self._sources)} 个来源 · {len(self._repos)} 个仓库"
         else:
-            root_text = "尚未选择目录"
+            root_text = "尚未添加仓库目录"
         f = QFont(self.font())
         f.setPointSize(8)
         p.setFont(f)
@@ -928,7 +1031,6 @@ class RepoPage(QWidget):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
                 background: transparent; }}
         """)
-        self.choose_btn.update()
         self.empty.update()
         if self._holder is not None:
             for row in self._holder.findChildren(RepoRow):
@@ -939,61 +1041,66 @@ class RepoPage(QWidget):
         self.update()
 
     # ---------- 目录与扫描 ----------
-    def _choose_dir(self):
-        start = str(self._root) if self._root else str(Path.home())
-        picked = QFileDialog.getExistingDirectory(self, "选择要扫描的目录", start)
-        if not picked:
-            return
-        self._root = Path(picked)
-        self._start_scan()
+    def _sync_sources(self):
+        """同步「仓库」页维护的来源列表，并刷新按钮可用状态。"""
+        self._sources = store.repo_sources()
+        self.refresh_btn.set_accept(bool(self._sources))
 
     def _is_scanning(self) -> bool:
-        return self._scan_thread is not None and self._scan_thread.isRunning()
+        return scan_service().scanning()
 
     def _refresh(self):
-        """重新扫描当前目录；扫描中或验证/推送过程中不打断。"""
-        if self._root is None or self._is_scanning():
+        """重新扫描全部来源；扫描中或验证/推送过程中不打断。"""
+        if not self._sources or self._is_scanning():
             return
         if self._detail is not None and self._detail.busy:
             return
-        self._start_scan()
+        self._start_scan(force=True)
 
-    def _start_scan(self):
+    def _start_scan(self, force: bool = False):
+        """按需扫描：来源未变时直接复用共享结果，不重复跑 git。"""
         self._close_detail(instant=True)
-        self._repos = []
-        if self._root is not None:
-            store.set_value("last_scan_root", str(self._root))
-        self._rebuild_rows()
+        self._sync_sources()
+        sig = sources_signature(self._sources)
+        changed = sig != self._scan_sig
+        self._scan_sig = sig
+        if scan_service().ensure(force):
+            self._apply_repos(scan_service().repos(), rebuild=force or changed)
+        else:
+            self._show_scanning()
+
+    def _show_scanning(self):
         self.empty.set_text("正在扫描目录…", "正在查找其中的 Git 仓库")
         self.empty.set_scanning(True)
         self.empty.show()
         self.scroll.hide()
-        self.choose_btn.set_accept(False)
         self.refresh_btn.set_accept(False)
         self._phase_timer.start()
-
-        thread = ScanThread(self._root, self)
-        thread.done.connect(self._on_scan_done)
-        thread.finished.connect(thread.deleteLater)
-        self._scan_thread = thread
-        thread.start()
         self.update()
 
-    def _on_scan_done(self, repos: list):
-        self._scan_thread = None
-        self._phase_timer.stop()
-        self.choose_btn.set_accept(True)
-        self.refresh_btn.set_accept(self._root is not None)
-        self._repos = sorted(repos, key=_repo_order)
-        self._rebuild_rows()
+    def _on_scan_finished(self, repos: list):
+        if sources_signature() != self._scan_sig:
+            return   # 结果对应的来源已过期，等下一次扫描
+        self._apply_repos(repos, rebuild=True)
 
-        if repos:
+    def _apply_repos(self, repos: list, rebuild: bool = True):
+        self._phase_timer.stop()
+        self.refresh_btn.set_accept(bool(self._sources))
+        if rebuild:
+            self._repos = sorted(repos, key=_repo_order)
+            self._rebuild_rows()
+
+        if self._repos:
             self.empty.hide()
             self.scroll.show()
         else:
             self.empty.set_scanning(False)
-            self.empty.set_text("没有找到 Git 仓库", "换一个目录试试，其中不含含 .git 的文件夹")
+            if self._sources:
+                self.empty.set_text("没有找到 Git 仓库", "换一个目录试试，其中不含含 .git 的文件夹")
+            else:
+                self.empty.set_text("还没有添加仓库目录", "到「仓库」页添加仓库或文件夹后再回来")
             self.empty.show()
+            self.scroll.hide()
         self.update()
 
     def _empty_tick(self):
@@ -1185,15 +1292,26 @@ class RepoPage(QWidget):
         if detail is None:
             return
         detail.set_busy(True)
+        if not store.sensitive_verify_required():
+            # 「安全」里关闭了敏感操作二次校验：直接推送
+            detail.set_status(f"正在推送到 {remote.remote}…", "busy")
+            self._start_push(remote)
+            return
         detail.set_status("正在等待系统身份验证…", "busy")
+        self._verify("GiTool：请验证身份以继续推送",
+                     lambda result: self._after_verify(remote, result))
 
+    def confirm(self, message: str, callback) -> None:
+        """为其它页面复用同一套系统验证流程（含前台化与焦点回收）。"""
+        self._verify(message, callback)
+
+    def _verify(self, message: str, callback) -> None:
         window = self.window()
         self._prompt_known = verify.prompt_windows()
-        self._verify_remote = remote
-        result, session = verify.start_verification(
-            "GiTool：请验证身份以继续推送", int(window.winId()))
+        self._verify_callback = callback
+        result, session = verify.start_verification(message, int(window.winId()))
         if result is not None:
-            self._after_verify(remote, result)
+            self._finish_verify(result)
             return
         self._verify_session = session
 
@@ -1239,10 +1357,14 @@ class RepoPage(QWidget):
         QTimer.singleShot(200, lambda: self._restore_focus(True))
         QTimer.singleShot(600, lambda: self._restore_focus(True))
         QTimer.singleShot(1500, lambda: self._restore_focus(True, True))
-        remote = self._verify_remote
-        self._verify_remote = None
-        if remote is not None:
-            self._after_verify(remote, result)
+        self._finish_verify(result)
+
+    def _finish_verify(self, result):
+        callback = self._verify_callback
+        self._verify_callback = None
+        self._stop_focus_timer()
+        if callback is not None:
+            callback(result)
 
     def _restore_focus(self, release: bool = False, force: bool = False):
         """验证结束把键盘焦点交回主窗口，稍后再撤销验证期间的置顶。
@@ -1339,10 +1461,8 @@ class RepoPage(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         self.setFocus()
-        if self._restore_pending:
-            self._restore_pending = False
-            if self._root is not None:
-                self._start_scan()
+        # 来源变化或从未扫描时才真正扫描，其余情况复用共享结果
+        self._start_scan()
 
     def shutdown(self):
         """窗口关闭前等待后台线程结束，避免 QThread 销毁告警。"""
@@ -1352,9 +1472,6 @@ class RepoPage(QWidget):
         if self._verify_session is not None:
             self._verify_session.release()
             self._verify_session = None
-        thread = self._scan_thread
-        if thread is not None and thread.isRunning():
-            thread.wait(3000)
 
 
 def _brief_error(text: str) -> str:
@@ -1365,3 +1482,371 @@ def _brief_error(text: str) -> str:
         if low.startswith(("fatal:", "error:", "remote:", "!")):
             return ln[:90]
     return (lines[-1] if lines else "未知错误")[:90]
+
+
+class SourceRow(QWidget):
+    """「仓库」页的一行来源：类型徽标 + 名称与路径 + 右侧删除按钮。"""
+
+    remove_requested = Signal(str, str)   # (path, kind)
+
+    H = 58
+
+    def __init__(self, path: str, kind: str, parent=None):
+        super().__init__(parent)
+        self.path, self.kind = path, kind
+        self._hot_remove = False
+        self.setFixedHeight(self.H)
+        self.setMouseTracking(True)
+
+    def _remove_rect(self) -> QRectF:
+        return QRectF(self.width() - 46, (self.height() - 26) / 2, 26, 26)
+
+    def mouseMoveEvent(self, e):
+        hot = self._remove_rect().contains(e.position())
+        if hot != self._hot_remove:
+            self._hot_remove = hot
+            self.setCursor(Qt.PointingHandCursor if hot else Qt.ArrowCursor)
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self._hot_remove = False
+        self.unsetCursor()
+        self.update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._remove_rect().contains(e.position()):
+            self.remove_requested.emit(self.path, self.kind)
+        super().mouseReleaseEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = _is_dark(self)
+        w, h = self.width(), self.height()
+
+        accent = theme.st("accent", dark)
+        badge_w, badge_h = 46.0, 20.0
+        bx, by = 16.0, (h - badge_h) / 2
+        badge_bg = QColor(accent)
+        badge_bg.setAlpha(28)
+        p.setPen(Qt.NoPen)
+        p.setBrush(badge_bg)
+        p.drawRoundedRect(QRectF(bx, by, badge_w, badge_h), 10, 10)
+        f = QFont(self.font())
+        f.setPointSize(8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(accent)
+        p.drawText(QRectF(bx, by, badge_w, badge_h), Qt.AlignCenter,
+                   "仓库" if self.kind == "repo" else "目录")
+
+        name = Path(self.path).name or self.path
+        text_x = bx + badge_w + 14
+        text_w = w - text_x - 62
+        f.setPointSize(11)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(text_x, 9, text_w, 20), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, name, text_w))
+
+        f.setPointSize(8)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(text_x, 29, text_w, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, self.path, text_w))
+
+        # 删除按钮
+        rr = self._remove_rect()
+        if self._hot_remove:
+            p.setPen(Qt.NoPen)
+            p.setBrush(theme.st("nav_hover", dark))
+            p.drawRoundedRect(rr, rr.width() / 2, rr.height() / 2)
+        p.setPen(QPen(_RED if self._hot_remove else theme.st("sub_text", dark),
+                      1.4, Qt.SolidLine, Qt.RoundCap))
+        cx, cy, d = rr.center().x(), rr.center().y(), 5.0
+        p.drawLine(QPointF(cx - d, cy - d), QPointF(cx + d, cy + d))
+        p.drawLine(QPointF(cx - d, cy + d), QPointF(cx + d, cy - d))
+
+        p.setPen(theme.st("panel_border", dark))
+        p.drawLine(16, h - 1, w - 16, h - 1)
+        p.end()
+
+
+class SourcesPage(QWidget):
+    """仓库页：登记单个仓库目录，或添加整个文件夹自动扫描，可添加多个。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.add_repo_btn = PillButton("添加仓库", self)
+        self.add_repo_btn.clicked.connect(self._add_repo)
+        self.add_dir_btn = PillButton("添加文件夹", self)
+        self.add_dir_btn.clicked.connect(self._add_dir)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.viewport().setAutoFillBackground(False)
+
+        self.empty = EmptyState(self, "添加文件夹")
+        self.empty.btn.clicked.connect(self._add_dir)
+        self.empty.set_text("还没有添加仓库", "添加单个仓库目录，或添加整个文件夹后自动扫描")
+
+        self._holder: QWidget | None = None
+        self._last_dir = str(Path.home())
+        self.apply_style()
+        self._rebuild()
+
+    def _panel_rect(self) -> QRect:
+        return QRect(30, _PANEL_TOP, max(0, self.width() - 60),
+                     max(0, self.height() - _PANEL_TOP - 28))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        panel = self._panel_rect()
+        self.add_dir_btn.move(panel.right() - self.add_dir_btn.width() - 14,
+                              panel.top() + 7)
+        self.add_repo_btn.move(self.add_dir_btn.x() - self.add_repo_btn.width() - 8,
+                               self.add_dir_btn.y())
+        body = QRect(panel.left() + 1, panel.top() + _BAR_H,
+                     panel.width() - 2, panel.height() - _BAR_H - 1)
+        self.scroll.setGeometry(body)
+        self.empty.setGeometry(body)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = _is_dark(self)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.st("content_bg", dark))
+        p.drawRect(self.rect())
+
+        left, top, w = 30, 28, self.width() - 60
+        f = QFont(self.font())
+        f.setPointSize(_TITLE_PT)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "仓库")
+
+        f.setPointSize(_SUB_PT)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
+                   "添加单独的仓库或整个目录，推送页会汇总显示其中的所有仓库")
+
+        panel = self._panel_rect()
+        r = theme.st("panel_radius", dark)
+        p.setPen(theme.st("panel_border", dark))
+        p.setBrush(theme.st("panel_bg", dark))
+        p.drawRoundedRect(QRectF(panel).adjusted(0.5, 0.5, -0.5, -0.5), r, r)
+
+        sources = store.repo_sources()
+        bar_text = f"已添加 {len(sources)} 项" if sources else "尚未添加仓库或目录"
+        f.setPointSize(8)
+        p.setFont(f)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(panel.left() + 18, panel.top() + 5,
+                          panel.width() - 292, _BAR_H - 10),
+                   Qt.AlignVCenter | Qt.AlignLeft, bar_text)
+
+        p.setPen(theme.st("panel_border", dark))
+        p.drawLine(panel.left() + 1, panel.top() + _BAR_H,
+                   panel.right() - 1, panel.top() + _BAR_H)
+        p.end()
+
+    def apply_style(self):
+        dark = _is_dark(self)
+        handle = theme.st("sub_text", dark).name()
+        self.scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{ width: 8px; background: transparent; margin: 2px 0; }}
+            QScrollBar::handle:vertical {{ background: {handle}; border-radius: 4px;
+                                          min-height: 28px; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent; }}
+        """)
+        self.add_repo_btn.update()
+        self.add_dir_btn.update()
+        self.empty.update()
+        if self._holder is not None:
+            for row in self._holder.findChildren(SourceRow):
+                row.update()
+        self.update()
+
+    # ---------- 来源增删 ----------
+    def _add_repo(self):
+        picked = QFileDialog.getExistingDirectory(self, "选择仓库根目录", self._last_dir)
+        if not picked:
+            return
+        if gitrepo.read_repo(Path(picked)) is None:
+            QMessageBox.information(
+                self, "不是 Git 仓库",
+                "所选目录没有检测到 Git 仓库。\n请选择仓库根目录，或改用「添加文件夹」。")
+            return
+        self._last_dir = picked
+        if add_source(picked, "repo"):
+            self._rebuild()
+
+    def _add_dir(self):
+        picked = QFileDialog.getExistingDirectory(self, "选择要扫描的文件夹", self._last_dir)
+        if not picked:
+            return
+        self._last_dir = picked
+        if add_source(picked, "folder"):
+            self._rebuild()
+
+    def _remove(self, path: str, kind: str):
+        remove_source(path, kind)
+        self._rebuild()
+
+    def _rebuild(self):
+        if self._holder is not None:
+            self._holder.deleteLater()
+            self._holder = None
+
+        sources = store.repo_sources()
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(0, 4, 0, 4)
+        lay.setSpacing(0)
+        for src in sources:
+            row = SourceRow(src["path"], src["kind"], holder)
+            row.remove_requested.connect(self._remove)
+            lay.addWidget(row)
+        lay.addStretch(1)
+
+        self.scroll.setWidget(holder)
+        self._holder = holder
+        if sources:
+            self.empty.hide()
+            self.scroll.show()
+        else:
+            self.scroll.hide()
+            self.empty.show()
+        self.update()
+
+
+class HomePage(QWidget):
+    """首页：仓库总览（总数、待推送、本地远程不一致、未配置远程）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._sources: list[dict] = []
+        self._repos: list[RepoInfo] = []
+        self._scanning = False
+        # 与推送页共用同一次扫描，切页不会重复跑 git
+        scan_service().finished.connect(self._on_scan_done)
+
+    def _metrics(self) -> tuple[int, int, int, int]:
+        repos = self._repos
+        total = len(repos)
+        pending = sum(1 for r in repos
+                      if any((not rb.exists) or rb.ahead > 0 for rb in r.remotes))
+        diverge = sum(1 for r in repos
+                      if any(rb.ahead > 0 or rb.behind > 0 for rb in r.remotes))
+        no_remote = sum(1 for r in repos if not r.remotes)
+        return total, pending, diverge, no_remote
+
+    def _card_rects(self) -> list[QRect]:
+        left, top, w = 30, _PANEL_TOP, max(0, self.width() - 60)
+        gap = 14
+        cw = max(0, (w - gap * 3) // 4)
+        return [QRect(left + i * (cw + gap), top, cw, 104) for i in range(4)]
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._refresh()
+
+    def _refresh(self):
+        svc = scan_service()
+        self._sources = store.repo_sources()
+        if svc.ensure():
+            self._repos = svc.repos()
+            self._scanning = False
+        elif not self._scanning:
+            self._scanning = True
+        self.update()
+
+    def _on_scan_done(self, repos: list):
+        self._scanning = False
+        self._repos = repos
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = _is_dark(self)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.st("content_bg", dark))
+        p.drawRect(self.rect())
+
+        left, top, w = 30, 28, self.width() - 60
+        f = QFont(self.font())
+        f.setPointSize(_TITLE_PT)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "首页")
+
+        f.setPointSize(_SUB_PT)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
+                   "仓库总览：数量、待推送与本地/远程状态")
+
+        total, pending, diverge, no_remote = self._metrics()
+        dash = self._scanning and not self._repos
+        cards = [
+            ("仓库总数", "—" if dash else str(total)),
+            ("待推送", "—" if dash else str(pending)),
+            ("本地/远程不一致", "—" if dash else str(diverge)),
+            ("未配置远程", "—" if dash else str(no_remote)),
+        ]
+
+        r = theme.st("panel_radius", dark)
+        for rect, (label, value) in zip(self._card_rects(), cards):
+            p.setPen(QPen(theme.st("panel_border", dark), 1))
+            p.setBrush(theme.st("panel_bg", dark))
+            p.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), r, r)
+
+            lf = QFont(self.font())
+            lf.setPointSize(9)
+            p.setFont(lf)
+            p.setPen(theme.st("sub_text", dark))
+            p.drawText(QRectF(rect.left() + 16, rect.top() + 14, rect.width() - 32, 20),
+                       Qt.AlignLeft | Qt.AlignVCenter, label)
+
+            vf = QFont(self.font())
+            vf.setPointSize(24)
+            vf.setBold(True)
+            p.setFont(vf)
+            p.setPen(theme.st("accent", dark) if label != "仓库总数"
+                     else theme.st("title_text", dark))
+            p.drawText(QRectF(rect.left() + 16, rect.top() + 40, rect.width() - 32, 42),
+                       Qt.AlignLeft | Qt.AlignVCenter, value)
+
+        # 卡片下方的状态行
+        if not self._sources:
+            status = "还没有添加仓库，到「仓库」页添加仓库或文件夹"
+        elif self._scanning:
+            status = f"正在扫描 {len(self._sources)} 个来源…"
+        else:
+            status = f"{len(self._sources)} 个来源 · 共 {total} 个仓库"
+        y = self._card_rects()[0].bottom() + 18
+        f.setPointSize(9)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(left, y, w, 20), Qt.AlignLeft | Qt.AlignVCenter, status)
+        p.end()
