@@ -6,7 +6,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPainterPath, QFont, QPen, QPalette, QGuiApplication, QLinearGradient,
-    QCursor,
+    QCursor, QFontMetrics,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from ..core import store, theme
 from ..core.config import Config
-from .repo_page import RepoPage
+from .repo_page import HomePage, RepoPage, SourcesPage, scan_service
 
 ZOOM_MS = 240        # 最大化/还原展开收起动画时长
 TITLE_BAR_H = 40       # macOS 顶栏高度（交通灯行）
@@ -443,11 +443,6 @@ class NavButton(QWidget):
         p.setPen(QPen(col, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         cw, x0, y0 = 9.0, 19.0, (self.height() - 9) / 2
         paths = {
-            'grid': lambda: (
-                p.drawRect(QRectF(x0, y0, cw, cw)),
-                p.drawLine(QPointF(x0 + cw / 2, y0), QPointF(x0 + cw / 2, y0 + cw)),
-                p.drawLine(QPointF(x0, y0 + cw / 2), QPointF(x0 + cw, y0 + cw / 2)),
-            ),
             'pulse': lambda: (
                 p.drawPolyline([
                     QPointF(x0, y0 + cw * 0.62),
@@ -467,6 +462,32 @@ class NavButton(QWidget):
                 p.drawEllipse(QPointF(x0 + cw / 2, y0 + cw / 2), cw / 2 - 0.4, cw / 2 - 0.4),
                 p.drawLine(QPointF(x0 + cw / 2, y0 + cw * 0.34),
                            QPointF(x0 + cw / 2, y0 + cw * 0.34)),
+            ),
+            'home': lambda: (
+                p.drawPolyline([QPointF(x0, y0 + cw * 0.46),
+                                QPointF(x0 + cw / 2, y0 + 0.6),
+                                QPointF(x0 + cw, y0 + cw * 0.46)]),
+                p.drawPolyline([QPointF(x0 + 1.4, y0 + cw * 0.46),
+                                QPointF(x0 + 1.4, y0 + cw),
+                                QPointF(x0 + cw - 1.4, y0 + cw),
+                                QPointF(x0 + cw - 1.4, y0 + cw * 0.46)]),
+            ),
+            'folder': lambda: (
+                p.drawPolyline([QPointF(x0, y0 + cw),
+                                QPointF(x0, y0 + cw * 0.2),
+                                QPointF(x0 + cw * 0.38, y0 + cw * 0.2),
+                                QPointF(x0 + cw * 0.5, y0 + cw * 0.38),
+                                QPointF(x0 + cw, y0 + cw * 0.38),
+                                QPointF(x0 + cw, y0 + cw),
+                                QPointF(x0, y0 + cw)]),
+            ),
+            'upload': lambda: (
+                p.drawLine(QPointF(x0 + cw / 2, y0 + cw * 0.78),
+                           QPointF(x0 + cw / 2, y0 + cw * 0.06)),
+                p.drawPolyline([QPointF(x0 + cw * 0.2, y0 + cw * 0.32),
+                                QPointF(x0 + cw / 2, y0 + cw * 0.06),
+                                QPointF(x0 + cw * 0.8, y0 + cw * 0.32)]),
+                p.drawLine(QPointF(x0, y0 + cw), QPointF(x0 + cw, y0 + cw)),
             ),
         }
         paths.get(self.icon_path or 'doc', paths['doc'])()
@@ -516,7 +537,9 @@ class Sidebar(QWidget):
         lay.addItem(self._sec_bot)
 
         self.nav_items = []
-        for key, label, ip in [("repos", "推送", "grid"),
+        for key, label, ip in [("home", "首页", "home"),
+                               ("sources", "仓库", "folder"),
+                               ("repos", "推送", "upload"),
                                ("settings", "设置", "gear")]:
             nb = NavButton(key, label, ip)
             nb.clicked_signal.connect(self.navigate_signal)
@@ -608,78 +631,242 @@ class ContentArea(QWidget):
         p.end()
 
 
-class StyleOption(QWidget):
-    """界面风格单选卡：radio 圆点 + 选项名称，选中态高亮为强调色"""
+class SegmentControl(QWidget):
+    """分段胶囊：档位等分，焦点气泡随选中档位滑动（220ms OutCubic）。
 
-    clicked_signal = Signal(str)
+    取自 LANSyncBox 的投递模式切换控件：浅色下为白气泡 + 淡阴影，
+    深色下为浅灰气泡；未选档位悬停时叠一层淡色作为反馈。
+    """
 
-    def __init__(self, key: str, title: str, parent=None):
+    valueChanged = Signal(str)
+
+    _MARGIN = 3
+    _H = 26
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.key, self.title = key, title
-        self.selected = False
-        self._hover = False
+        self.setFixedHeight(self._H)
+        self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
+        self._keys, self._labels = [], []
+        self._value = ""
+        self._pos = 0.0
+        self._hover_side = -1
+        self._anim = None
 
-    def set_selected(self, sel: bool):
-        if self.selected != sel:
-            self.selected = sel
+    def add_segment(self, key: str, label: str):
+        self._keys.append(key)
+        self._labels.append(label)
+        if len(self._keys) == 1:
+            self._value = key
+        # 等分档位：宽度取最宽文字，各档一致，气泡位置 = 档位序号
+        fm = QFontMetrics(self._seg_font())
+        seg = max(fm.horizontalAdvance(t) for t in self._labels) + 30
+        self.setFixedWidth(seg * len(self._keys))
+
+    def value(self) -> str:
+        return self._value
+
+    def set_value(self, value: str, animate: bool = True):
+        """切换档位；animate=False 时直接到位"""
+        if value not in self._keys:
+            return
+        self._value = value
+        target = float(self._keys.index(value))
+        if animate and abs(target - self._pos) > 1e-3:
+            self._stop_anim()
+            anim = QVariantAnimation(self)
+            anim.setDuration(220)
+            anim.setStartValue(self._pos)
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.valueChanged.connect(lambda v: self._set_pos(float(v)))
+            anim.finished.connect(self._on_anim_finished)
+            self._anim = anim
+            anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        else:
+            self._stop_anim()
+            self._pos = target
             self.update()
 
+    def _set_pos(self, v: float):
+        self._pos = v
+        self.update()
+
+    def _stop_anim(self):
+        # DeleteWhenStopped 会让动画在停止时被 Qt 删除，先摘掉引用再 stop
+        anim = self._anim
+        self._anim = None
+        if anim is not None:
+            anim.stop()
+
+    def _on_anim_finished(self):
+        self._anim = None
+
+    def _seg_font(self) -> QFont:
+        f = QFont(self.font())
+        f.setPointSize(10)
+        f.setWeight(QFont.Weight.DemiBold)
+        return f
+
+    def _side_at(self, x: float) -> int:
+        n = len(self._keys)
+        if n == 0 or x < 0:
+            return -1
+        return min(int(x / (self.width() / float(n))), n - 1)
+
     def enterEvent(self, e):
-        self._hover = True
+        self._hover_side = self._side_at(e.position().x())
         self.update()
         super().enterEvent(e)
 
     def leaveEvent(self, e):
-        self._hover = False
+        self._hover_side = -1
         self.update()
         super().leaveEvent(e)
 
-    def mouseReleaseEvent(self, e):
-        if self.rect().contains(e.position().toPoint()):
-            self.clicked_signal.emit(self.key)
-        super().mouseReleaseEvent(e)
+    def mouseMoveEvent(self, e):
+        self._hover_side = self._side_at(e.position().x())
+        self.update()
+        super().mouseMoveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            side = self._side_at(e.position().x())
+            if side >= 0 and self._keys[side] != self._value:
+                self.valueChanged.emit(self._keys[side])
+        super().mousePressEvent(e)
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         dark = is_dark(self)
-        pr = theme.st("panel_radius", dark)
+        w, h = self.width(), self.height()
+        n = len(self._keys)
+        if n == 0:
+            p.end()
+            return
+        r = h / 2.0
+        m = self._MARGIN
+        seg_w = w / float(n)
 
-        # 内缩 1px 让圆角描边完整落在控件内，避免圆弧外侧像素被裁、左侧边框线显示不全
-        card = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
-        if self.selected:
-            p.setPen(QPen(theme.st("accent", dark), 1.4))
-            p.setBrush(theme.st("panel_bg", dark))
-        elif self._hover:
-            # 悬停预览：描边用透明强调色，底色叠一层 nav_hover 染色，提示可点击
-            accent = theme.st("accent", dark)
-            p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 120), 1.2))
-            p.setBrush(theme.st("panel_bg", dark))
-            p.drawRoundedRect(card, pr, pr)
+        # 胶囊底板（中性玻璃）
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 26) if dark else QColor(15, 23, 42, 24))
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+
+        active_i = self._keys.index(self._value) if self._value in self._keys else 0
+        # 未选中档位的悬浮反馈
+        if 0 <= self._hover_side != active_i:
+            hover = QRectF(self._hover_side * seg_w + m, m,
+                           seg_w - 2 * m, h - 2 * m)
+            p.setBrush(QColor(255, 255, 255, 30) if dark else QColor(15, 23, 42, 32))
+            p.drawRoundedRect(hover, (h - 2 * m) / 2.0, (h - 2 * m) / 2.0)
+
+        # 焦点气泡：随 _pos 滑动，与档位中心严格对齐
+        bubble = QRectF(m + self._pos * seg_w, m, seg_w - 2 * m, h - 2 * m)
+        radius = (h - 2 * m) / 2.0
+        if not dark:
+            # 浅色下加深色淡阴影 + 描边，避免白气泡与灰底板糊在一起
             p.setPen(Qt.NoPen)
-            p.setBrush(theme.st("nav_hover", dark))
-            p.drawRoundedRect(card, pr, pr)
+            p.setBrush(QColor(15, 23, 42, 22))
+            p.drawRoundedRect(QRectF(bubble.x(), bubble.y() + 1,
+                                     bubble.width(), bubble.height()), radius, radius)
+            p.setPen(QPen(QColor(15, 23, 42, 18), 1))
         else:
-            p.setPen(QPen(theme.st("panel_border", dark), 1))
-            p.setBrush(theme.st("panel_bg", dark))
-        p.drawRoundedRect(card, pr, pr)
-
-        rc = QPointF(30, self.height() / 2)
-        p.setPen(QPen(theme.st("accent", dark), 1.3))
-        p.setBrush(QColor(255, 255, 255, 0))
-        p.drawEllipse(rc, 8, 8)
-        if self.selected:
             p.setPen(Qt.NoPen)
-            p.setBrush(theme.st("accent", dark))
-            p.drawEllipse(rc, 4.2, 4.2)
+        p.setBrush(QColor("#eceef2") if dark else QColor("#ffffff"))
+        p.drawRoundedRect(bubble, radius, radius)
 
-        # 标题垂直居中（去掉副标题后仅保留选项名称）
+        # 档位文字
+        p.setFont(self._seg_font())
+        for i, label in enumerate(self._labels):
+            if i == active_i:
+                color = QColor("#1f2328")
+            else:
+                color = QColor("#a0a0a0") if dark else QColor("#6b7280")
+            p.setPen(color)
+            p.drawText(QRectF(i * seg_w, 0, seg_w, h),
+                       Qt.AlignHCenter | Qt.AlignVCenter, label)
+        p.end()
+
+
+class SettingRow(QWidget):
+    """设置行：左侧分组标题，右侧分段胶囊；只有一个选项时右侧显示取值文本"""
+
+    valueChanged = Signal(str)
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self._value_text = ""
+        self._base = (-99999, -99999, 1, 1)
+        self._hint = ""
+        self._hint_timer = QTimer(self)
+        self._hint_timer.setSingleShot(True)
+        self._hint_timer.timeout.connect(self.clear_hint)
+        self.seg = SegmentControl(self)
+        self.seg.valueChanged.connect(self.valueChanged)
+
+    def add_segment(self, key: str, label: str):
+        self.seg.add_segment(key, label)
+
+    def set_value_text(self, text: str):
+        self._value_text = text
+        self.seg.setVisible(not text)
+        self.update()
+
+    def set_value(self, key: str, animate: bool = True):
+        self.seg.set_value(key, animate)
+
+    def show_hint(self, text: str, ms: int = 2800):
+        """在行内显示临时提示，避免弹窗打断操作。"""
+        self._hint = text
+        self.update()
+        self._hint_timer.start(ms)
+
+    def clear_hint(self):
+        self._hint = ""
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.seg.move(self.width() - self.seg.width() - 16,
+                      (self.height() - self.seg.height()) // 2)
+
+    def paintEvent(self, e):
+        # 行本身不画卡片底/描边，只画左侧标题；控件由子级胶囊负责
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = is_dark(self)
+
         cy = self.height() / 2
-        tf = QFont(self.font()); tf.setPointSize(11); tf.setBold(True)
+        tf = QFont(self.font())
+        tf.setPointSize(11)
+        tf.setBold(True)
         p.setFont(tf)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(52, cy - 16, self.width() - 68, 32), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        if self._hint:
+            # 有行内提示时标题上移，提示写在下方，右侧胶囊不受影响
+            p.drawText(QRectF(16, 8, self.width() - 32, 26),
+                       Qt.AlignLeft | Qt.AlignVCenter, self.title)
+            hf = QFont(self.font())
+            hf.setPointSize(9)
+            p.setFont(hf)
+            p.setPen(QColor("#e5534b"))
+            txt = QFontMetrics(hf).elidedText(
+                self._hint, Qt.ElideRight,
+                max(80, self.width() - self.seg.width() - 48))
+            p.drawText(QRectF(16, 34, self.width() - 32, 20),
+                       Qt.AlignLeft | Qt.AlignVCenter, txt)
+        else:
+            p.drawText(QRectF(16, cy - 16, self.width() - 32, 32),
+                       Qt.AlignLeft | Qt.AlignVCenter, self.title)
+            if self._value_text:
+                p.setFont(self.seg._seg_font())
+                p.setPen(theme.st("sub_text", dark))
+                p.drawText(QRectF(16, cy - 16, self.width() - 32, 32),
+                           Qt.AlignRight | Qt.AlignVCenter, self._value_text)
         p.end()
 
 
@@ -794,20 +981,7 @@ class _RightArea(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
 
-    def paintEvent(self, e):
-        page = self.page
-        active = page.categories[page._active][2] if page.categories else []
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        dark = is_dark(self)
-        f = QFont(self.font()); f.setPointSize(9); f.setWeight(QFont.Weight.Medium)
-        p.setFont(f)
-        p.setPen(theme.st("section_text", dark))
-        for y, (sid, t, _) in zip(page._title_y, active):
-            p.drawText(QRectF(0, y - page._scroll, self.width(), 22),
-                       Qt.AlignVCenter | Qt.AlignLeft, t)
-        p.end()
-        super().paintEvent(e)
+    # 分组标题画在 SettingRow 卡片里，容器本身只负责承载与滚动
 
 
 class SettingsPage(ContentArea):
@@ -822,18 +996,17 @@ class SettingsPage(ContentArea):
 
     option_picked = Signal(str, str)      # (分组id, 选项key)，分发层只需关心分组
     CARD_H = 68
-    MAX_PER_ROW = 4
     MENU_W = 96                           # 左侧分类菜单宽度
 
     def __init__(self, parent=None):
         super().__init__("设置", "个性化外观与行为")
-        self.categories = []              # [cid, title, sections]; sections=[sid,标题,[(key,card)]]
+        # [cid, title, sections]；sections=[sid, 标题, [(key,label)], 行控件]
+        self.categories = []
         self._active = 0
         self._content_top = 0
         self._content_w = 0
         self._content_h = 0
         self._scroll = 0
-        self._title_y = []
         self._cat_anim = None                 # 分类切换过渡动画
         # 分类子菜单控件 + 右侧内容容器（作为整体做切换过渡）
         self._menu = CategoryList(self)
@@ -851,7 +1024,10 @@ class SettingsPage(ContentArea):
     def add_section(self, cid: str, section_id: str, title: str):
         for cat in self.categories:
             if cat[0] == cid:
-                cat[2].append([section_id, title, []])
+                row = SettingRow(title, self._right)
+                row.valueChanged.connect(
+                    lambda k, sid=section_id: self.option_picked.emit(sid, k))
+                cat[2].append([section_id, title, [], row])
                 return
 
     def add_option(self, cid: str, section_id: str, key: str, label: str):
@@ -860,13 +1036,8 @@ class SettingsPage(ContentArea):
                 continue
             for sec in cat[2]:
                 if sec[0] == section_id:
-                    card = StyleOption(key, label)
-                    card.clicked_signal.connect(lambda k: self.option_picked.emit(section_id, k))
-                    card.setParent(self._right)
-                    # 布局只覆盖当前激活分类的卡片；给其它卡片一个离屏默认值，
-                    # 避免 _apply_scroll 读取未初始化卡片时崩溃
-                    card._base = (-99999, -99999, 1, 1)
-                    sec[2].append((key, card))
+                    sec[2].append((key, label))
+                    sec[3].add_segment(key, label)
                     return
 
     def _register_builtin(self):
@@ -883,16 +1054,24 @@ class SettingsPage(ContentArea):
         for key in theme.THEMES:
             self.add_option("personal", "theme", key, theme.THEME_LABEL[key])
 
+        self.add_category("security", "安全")
+        self.add_section("security", "sensitive", "敏感操作二次校验")
+        self.add_option("security", "sensitive", "off", "关闭")
+        self.add_option("security", "sensitive", "on", "开启")
+
     def _refresh_menu(self):
         self._menu.set_items([c[1] for c in self.categories])
 
     def _preselect(self):
         for cat in self.categories:
-            for sid, _, items in cat[2]:
+            for sid, _, items, row in cat[2]:
                 if sid == "style":
-                    self.select(sid, theme.style_name())
+                    self.select(sid, theme.style_name(), animate=False)
                 elif sid == "theme":
-                    self.select(sid, theme.theme_mode_name())
+                    self.select(sid, theme.theme_mode_name(), animate=False)
+                elif sid == "sensitive":
+                    self.select(sid, "on" if store.sensitive_verify_required() else "off",
+                                animate=False)
         # 初始选中首个包含分组内容的分类
         self._active = next((i for i, c in enumerate(self.categories) if c[2]), 0)
         self._menu.set_active(self._active)
@@ -904,33 +1083,31 @@ class SettingsPage(ContentArea):
         self._measure()
         self._apply_scroll()
 
-    def select(self, section_id: str, key: str):
+    def select(self, section_id: str, key: str, animate: bool = True):
         for cat in self.categories:
-            for sid, _, items in cat[2]:
+            for sid, _, items, row in cat[2]:
                 if sid == section_id:
-                    for k, card in items:
-                        card.set_selected(k == key)
+                    row.set_value(key, animate)
+
+    def show_hint(self, section_id: str, text: str):
+        """在指定设置行的行内显示临时提示（用于验证失败等反馈）。"""
+        for cat in self.categories:
+            for sid, _, items, row in cat[2]:
+                if sid == section_id:
+                    row.show_hint(text)
 
     def _measure(self):
-        self._title_y = []
         gap = 16
         y = 0
-        for sid, sec_title, items in self.categories[self._active][2]:
-            self._title_y.append(y)
+        for sid, sec_title, items, row in self.categories[self._active][2]:
             if not items:
+                row.setVisible(False)
                 continue
-            y += 22 + 10
-            n = len(items)
-            cols = max(1, min(n, self.MAX_PER_ROW))
-            card_w = (self._content_w - (cols - 1) * gap) // cols
-            for i, (key, card) in enumerate(items):
-                r, c = divmod(i, cols)
-                card._base = (c * (card_w + gap), y + r * (self.CARD_H + 10),
-                              card_w, self.CARD_H)
-            rows = (n + cols - 1) // cols
-            y += rows * (self.CARD_H + 10) - 10
-            y += 30
-        self._content_h = max(0, y)
+            # 单选项的分组（如版本信息）不显示胶囊，右侧直接显示取值
+            row.set_value_text(items[0][1] if len(items) == 1 else "")
+            row._base = (0, y, self._content_w, self.CARD_H)
+            y += self.CARD_H + gap
+        self._content_h = max(0, y - gap)
 
     def _layout_right(self):
         """左侧菜单 + 右侧容器几何，并重排当前分类内容。"""
@@ -951,16 +1128,16 @@ class SettingsPage(ContentArea):
         self._scroll = max(0, min(self._scroll, self._content_h - view_h))
 
     def _apply_scroll(self):
-        """按激活分类定位卡片；其余分类的卡片隐藏，避免不同分类间互串重叠。"""
+        """按激活分类定位设置行；其余分类的行隐藏，避免不同分类间互串重叠。"""
         for i, cat in enumerate(self.categories):
-            for _, _, items in cat[2]:
-                for _, card in items:
-                    if i == self._active:
-                        x, y, w, h = card._base
-                        card.setGeometry(x, y - self._scroll, w, h)
-                        card.setVisible(True)
-                    else:
-                        card.setVisible(False)
+            for _, _, items, row in cat[2]:
+                active = i == self._active and items
+                if not active:
+                    row.setVisible(False)
+                    continue
+                x, y, w, h = row._base
+                row.setGeometry(x, y - self._scroll, w, h)
+                row.setVisible(True)
         self._right.update()
 
     def wheelEvent(self, e):
@@ -1086,6 +1263,9 @@ class AppWindow(QWidget):
         # 注册内容页（设置页使用专门的交互页面，关于页使用独立信息页）
         self.settings_page = None
         self.repo_page = None
+        self.sources_page = None
+        self.home_page = None
+        self._sensitive_busy = False   # 关闭二次校验的验证进行中，防止重复触发
         for item in self.sidebar.nav_items:
             if item.key == "settings":
                 p = SettingsPage()
@@ -1093,6 +1273,12 @@ class AppWindow(QWidget):
                 p.option_picked.connect(self._on_settings_option)
             elif item.key == "about":
                 p = AboutPage()
+            elif item.key == "home":
+                p = HomePage()
+                self.home_page = p
+            elif item.key == "sources":
+                p = SourcesPage()
+                self.sources_page = p
             elif item.key == "repos":
                 p = RepoPage()
                 self.repo_page = p
@@ -1255,6 +1441,8 @@ class AppWindow(QWidget):
             w.update()
         if self.repo_page is not None:
             self.repo_page.apply_style()
+        if self.sources_page is not None:
+            self.sources_page.apply_style()
         for b in self.sidebar.header.findChildren(TrafficLightButton):
             b.update()
         self.settings_page.select("style", key)
@@ -1267,6 +1455,32 @@ class AppWindow(QWidget):
         elif sid == "theme":
             self.set_theme(key)
             store.set_value("theme", theme.theme_mode_name())
+        elif sid == "sensitive":
+            if self._sensitive_busy:
+                return
+            if key == "on":
+                store.set_value("sensitive_verify", True)
+                self.settings_page.select("sensitive", "on")
+            else:
+                self._disable_sensitive_guard()
+
+    def _disable_sensitive_guard(self):
+        """关闭敏感操作二次校验本身需要验证身份；不通过则保持开启。
+
+        失败提示写在设置行内，不弹窗，避免再让用户点一次确认。
+        """
+        self._sensitive_busy = True
+
+        def done(result):
+            self._sensitive_busy = False
+            if not result.ok:
+                self.settings_page.show_hint(
+                    "sensitive", f"{result.message}，保护保持开启")
+                return
+            store.set_value("sensitive_verify", False)
+            self.settings_page.select("sensitive", "off")
+
+        self.repo_page.confirm("GiTool：关闭敏感操作二次校验需要验证身份", done)
 
     def set_theme(self, key: str):
         if not theme.set_theme(key):
@@ -1277,6 +1491,8 @@ class AppWindow(QWidget):
             w.update()
         if self.repo_page is not None:
             self.repo_page.apply_style()
+        if self.sources_page is not None:
+            self.sources_page.apply_style()
         for b in self.sidebar.header.findChildren(TrafficLightButton):
             b.update()
         self.settings_page.select("theme", key)
@@ -1385,6 +1601,7 @@ class AppWindow(QWidget):
         # 关闭前收敛后台扫描/验证线程，避免 QThread 在运行中被销毁
         if self.repo_page is not None:
             self.repo_page.shutdown()
+        scan_service().shutdown()
         super().closeEvent(e)
 
 

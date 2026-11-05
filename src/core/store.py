@@ -58,3 +58,27 @@ def set_value(key: str, value) -> None:
         return
     data[key] = value
     save(data)
+
+
+def repo_sources() -> list[dict]:
+    """已登记的仓库来源：每项 {"path": 绝对路径, "kind": "repo" | "folder"}。"""
+    raw = get("repo_sources")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        path, kind = item.get("path"), item.get("kind")
+        if isinstance(path, str) and path and kind in ("repo", "folder"):
+            out.append({"path": path, "kind": kind})
+    return out
+
+
+def save_repo_sources(items: list[dict]) -> None:
+    set_value("repo_sources", [{"path": i["path"], "kind": i["kind"]} for i in items])
+
+
+def sensitive_verify_required() -> bool:
+    """敏感操作（推送、关闭保护本身）是否需要二次校验；默认关闭。"""
+    return bool(get("sensitive_verify", False))

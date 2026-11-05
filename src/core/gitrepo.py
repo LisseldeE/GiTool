@@ -216,6 +216,33 @@ def scan(root: Path) -> list[RepoInfo]:
     return repos
 
 
+def scan_sources(sources: list[dict]) -> list[RepoInfo]:
+    """按来源列表汇总仓库：folder 递归查找，repo 直接读取。
+
+    同一仓库被多处覆盖时只保留一份（按解析后的真实路径去重）。
+    """
+    repos, seen = [], set()
+    for src in sources:
+        path = Path(str(src.get("path", "")))
+        if not path.is_dir():
+            continue
+        candidates = [path] if src.get("kind") == "repo" else find_repos(path)
+        for cand in candidates:
+            try:
+                key = str(cand.resolve()).lower()
+            except OSError:
+                key = str(cand).lower()
+            if key in seen:
+                continue
+            info = read_repo(cand)
+            if info is None:
+                continue
+            seen.add(key)
+            repos.append(info)
+    repos.sort(key=lambda r: r.name.lower())
+    return repos
+
+
 def push_args(remote: str, branch: str, set_upstream: bool) -> list[str]:
     """构造推送参数（配合 QProcess 在仓库目录中执行 git）。"""
     args = ["push", "--porcelain"]
