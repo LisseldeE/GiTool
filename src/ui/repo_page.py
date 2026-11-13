@@ -6,20 +6,21 @@
 
 from __future__ import annotations
 
+import sys
 import zlib
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEasingCurve, QLineF, QObject, QPointF, QProcess, QRect, QRectF, QSize, Qt,
-    QThread, QTimer, QVariantAnimation, Signal,
+    QEasingCurve, QEvent, QLineF, QObject, QPoint, QPointF, QProcess, QRect, QRectF,
+    QSize, Qt, QThread, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter,
+    QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter,
     QPainterPath, QPalette, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QScrollBar, QVBoxLayout, QWidget,
 )
 
 from ..core import gitrepo, store, theme, verify
@@ -42,6 +43,38 @@ _BAR_H = 46
 # 一级条目 / 二级详情切换的过渡参数：与侧栏切页完全一致
 _DETAIL_SHIFT = 30      # 滑移距离(px)
 _DETAIL_MS = 200        # 单段动画时长
+
+# 条目内分支切换的过渡参数（内容淡出→换数据→淡入）
+_BRANCH_MS = 160
+_BRANCH_SHIFT = 14
+_CARET_W = 12          # 分支胶囊内下拉箭头占位宽度
+_FOLD_MS = 200         # 目录子条目的展开/收起时长
+_BOX_MAX = 16777215    # QWIDGETSIZE_MAX：无高度约束
+
+# Win11 会给顶层窗口自动加 8px 圆角，会裁掉自绘的 12px 圆角并在四角留下暗边；
+# 同时系统会给窗口画 1px 描边，在浅色界面上看起来就是四周发黑
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWA_BORDER_COLOR = 34
+_DWMWCP_DONOTROUND = 1
+_DWMWA_COLOR_NONE = 0xFFFFFFFE
+
+
+def _square_corners(widget) -> None:
+    """关掉系统圆角与窗口描边，让自绘圆角完整显示。非 Windows 直接忽略。"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        hwnd = int(widget.winId())
+        dwm = ctypes.windll.dwmapi
+        corner = ctypes.c_int(_DWMWCP_DONOTROUND)
+        dwm.DwmSetWindowAttribute(hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE,
+                                  ctypes.byref(corner), ctypes.sizeof(corner))
+        border = ctypes.c_uint(_DWMWA_COLOR_NONE)
+        dwm.DwmSetWindowAttribute(hwnd, _DWMWA_BORDER_COLOR,
+                                  ctypes.byref(border), ctypes.sizeof(border))
+    except Exception:
+        pass
 
 
 def _row_height(repo: RepoInfo) -> int:
@@ -116,6 +149,15 @@ def sources_signature(items: list[dict] | None = None) -> tuple:
     return tuple((i["path"], i["kind"]) for i in items)
 
 
+def _path_under(child: Path, parent: Path) -> bool:
+    """判断 child 是否位于 parent 目录下（含自身）。"""
+    try:
+        Path(child).relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def stop_thread(thread: QThread | None) -> None:
     """退出前收敛后台扫描线程：先等，仍未结束则中断/终止，避免 QThread 在运行中被销毁。"""
     if thread is None or not thread.isRunning():
@@ -134,6 +176,7 @@ class ScanService(QObject):
 
     started = Signal()
     finished = Signal(object)   # list[RepoInfo]
+    changed = Signal(object)    # 局部更新（如推送完成）后的结果，无需重建列表
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -176,6 +219,16 @@ class ScanService(QObject):
         self._thread = None
         self._repos = repos
         self.finished.emit(repos)
+
+    def update_repo(self, path: Path, info: RepoInfo | None):
+        """推送后局部更新缓存，让首页等复用缓存的页面同步到最新状态。"""
+        if not self._repos:
+            return
+        if info is None:
+            self._repos = [r for r in self._repos if r.path != path]
+        else:
+            self._repos = [info if r.path == path else r for r in self._repos]
+        self.changed.emit(self._repos)
 
     def shutdown(self):
         thread = self._thread
@@ -275,10 +328,19 @@ class ArrowButton(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._hover = False
+        self._locked = False      # 推送进行中：锁死，不响应悬浮与点击
         self.setCursor(Qt.PointingHandCursor)
 
+    def set_locked(self, locked: bool):
+        if self._locked == locked:
+            return
+        self._locked = locked
+        self._hover = False
+        self.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
+        self.update()
+
     def enterEvent(self, e):
-        self._hover = True
+        self._hover = not self._locked
         self.update()
         super().enterEvent(e)
 
@@ -288,13 +350,15 @@ class ArrowButton(QWidget):
         super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if self.rect().contains(e.position().toPoint()):
+        if (not self._locked and self.rect().contains(e.position().toPoint())):
             self.clicked.emit()
         super().mouseReleaseEvent(e)
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        if self._locked:
+            p.setOpacity(0.35)
         dark = _is_dark(self)
         accent = theme.st("accent", dark)
 
@@ -313,15 +377,187 @@ class ArrowButton(QWidget):
         p.end()
 
 
+class BranchChip(QWidget):
+    """分支胶囊的点击热区：与胶囊完全重合，只负责悬停与点击，外观由条目绘制。"""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover = False
+        self._locked = False
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+
+    def set_locked(self, locked: bool):
+        if self._locked == locked:
+            return
+        self._locked = locked
+        self._hover = False
+        self.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
+        self._repaint_row()
+
+    def enterEvent(self, e):
+        self._hover = not self._locked
+        self._repaint_row()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self._repaint_row()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if not self._locked and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+    def _repaint_row(self):
+        """胶囊画在条目上，悬停时要让条目重绘。"""
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.update()
+
+
+class BranchPicker(QWidget):
+    """分支下拉：自绘圆角面板，点击选择后关闭。"""
+
+    picked = Signal(str)
+
+    ROW_H = 28
+    MAX_ROWS = 8
+
+    def __init__(self, branches: list[str], current: str, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.branches = list(branches)
+        self.current = current
+        self._hover = -1
+        self._offset = 0
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAutoFillBackground(False)
+
+        f = QFont(self.font())
+        f.setPointSize(9)
+        w = 150
+        for name in self.branches:
+            w = max(w, _text_width(f, name) + 54)
+        rows = min(len(self.branches), self.MAX_ROWS)
+        self.resize(w, rows * self.ROW_H + 10)
+
+    # ---------- 几何 ----------
+    def showEvent(self, e):
+        # 系统圆角会把自绘圆角裁成直角并留下暗边，先关掉
+        _square_corners(self)
+        super().showEvent(e)
+
+    def _max_offset(self) -> int:
+        extra = len(self.branches) - self.MAX_ROWS
+        return max(0, extra * self.ROW_H)
+
+    def _index_at(self, pos) -> int:
+        if not (6 <= pos.y() <= self.height() - 6):
+            return -1
+        idx = int((pos.y() - 5 + self._offset) // self.ROW_H)
+        return idx if 0 <= idx < len(self.branches) else -1
+
+    def popup_at(self, pos: QPoint):
+        """在给定全局坐标下方展开；空间不足时向上翻。"""
+        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = min(max(pos.x(), area.left() + 4), area.right() - self.width() - 4)
+        y = pos.y()
+        if y + self.height() > area.bottom() - 4:
+            y = pos.y() - self.height() - 26
+        self.move(x, max(area.top() + 4, y))
+        self.show()
+
+    # ---------- 交互 ----------
+    def mouseMoveEvent(self, e):
+        idx = self._index_at(e.position())
+        if idx != self._hover:
+            self._hover = idx
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self.update()
+        super().leaveEvent(e)
+
+    def wheelEvent(self, e):
+        self._offset = max(0, min(self._max_offset(),
+                                  self._offset - e.angleDelta().y() // 3))
+        self.update()
+        super().wheelEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        idx = self._index_at(e.position())
+        if idx >= 0:
+            name = self.branches[idx]
+            self.picked.emit(name)
+            self.close()
+            return
+        super().mouseReleaseEvent(e)
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # 先整块清成透明：否则圆角外的残留像素会形成杂色块
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.fillRect(self.rect(), Qt.transparent)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        # 取父条目所在窗口的当前主题，跟随深浅色切换
+        dark = _is_dark(self.parentWidget() or self)
+        radius = theme.st("panel_radius", dark)
+        p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.setBrush(theme.st("panel_bg", dark))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                          radius, radius)
+
+        # 列表内容裁到圆角内，避免悬浮底色越过圆角边缘
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5),
+                            max(1, radius - 1), max(1, radius - 1))
+        p.setClipPath(clip)
+        accent = theme.st("accent", dark)
+        f = QFont(self.font())
+        f.setPointSize(9)
+        for i, name in enumerate(self.branches):
+            y = 5 + i * self.ROW_H - self._offset
+            row = QRectF(5, y, self.width() - 10, self.ROW_H)
+            if row.bottom() < 0 or row.top() > self.height():
+                continue
+            if i == self._hover:
+                bg = QColor(accent)
+                bg.setAlpha(30 if dark else 22)
+                p.setPen(Qt.NoPen)
+                p.setBrush(bg)
+                p.drawRoundedRect(row.adjusted(0, 2, 0, -2), 6, 6)
+            p.setFont(f)
+            p.setPen(accent if name == self.current else theme.st("title_text", dark))
+            p.drawText(row.adjusted(12, 0, -12, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                       _elide(p, name, row.width() - 24))
+        p.end()
+
+
 class RepoRow(QWidget):
     """单个仓库条目：图标、名称、分支、本地提交、各远程状态。"""
 
-    open_requested = Signal(object, object)   # (RepoInfo, RepoRow)
+    open_requested = Signal(object, object)    # (RepoInfo, RepoRow)
+    branch_requested = Signal(object, str)     # (RepoRow, 分支名)
 
     def __init__(self, repo: RepoInfo, parent=None):
         super().__init__(parent)
         self.repo = repo
         self._hover = False
+        self._alpha = 1.0          # 分支切换时内容的透明度
+        self._dx = 0               # 分支切换时内容的水平位移
+        self._anim: QVariantAnimation | None = None
         self.setFixedHeight(_row_height(repo))
 
         self._icon: QIcon | None = None
@@ -333,11 +569,97 @@ class RepoRow(QWidget):
         self.arrow.setVisible(_pushable(repo))
         self.arrow.clicked.connect(lambda: self.open_requested.emit(self.repo, self))
 
+        self.chip = BranchChip(self)
+        self.chip.clicked.connect(self._open_branch_picker)
+        self.chip.setVisible(len(repo.branches) > 1)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         # 铺满条目右侧整条区域，右边缘与条目右边缘完全贴合
         self.arrow.setGeometry(self.width() - ArrowButton.WIDTH, 0,
                                ArrowButton.WIDTH, self.height())
+        self._relayout()
+
+    def _relayout(self):
+        """让分支点击热区与绘制的胶囊完全重合（含右侧箭头区域）。"""
+        if not hasattr(self, "chip"):
+            return
+        self.chip.setGeometry(70, 51, self._chip_width(), 18)
+
+    def _chip_width(self) -> int:
+        """胶囊宽度：文字 + 左右留白，可切换分支时再加箭头位。"""
+        w = _text_width(_chip_font(self.font()), self.repo.branch) + 16
+        if len(self.repo.branches) > 1:
+            w += _CARET_W
+        return int(w)
+
+    # ---------- 分支切换 ----------
+    def _open_branch_picker(self):
+        if self._anim is not None or self.chip._locked or len(self.repo.branches) < 2:
+            return
+        picker = BranchPicker(self.repo.branches, self.repo.branch, self)
+        picker.picked.connect(self._emit_branch)
+        gp = self.chip.mapToGlobal(self.chip.rect().bottomLeft())
+        picker.popup_at(QPoint(gp.x(), gp.y() + 2))
+
+    def _emit_branch(self, branch: str):
+        if branch != self.repo.branch:
+            self.branch_requested.emit(self, branch)
+
+    def set_repo(self, repo: RepoInfo, animate: bool = True):
+        """切换到另一个分支的仓库状态；内容做淡出→换数据→淡入的过渡。"""
+        if not animate or self._anim is not None:
+            self._apply_repo(repo)
+            return
+
+        out = QVariantAnimation(self)
+        out.setDuration(_BRANCH_MS)
+        out.setStartValue(0.0)
+        out.setEndValue(1.0)
+        out.setEasingCurve(QEasingCurve.OutCubic)
+
+        def f_out(t: float):
+            self._alpha = 1.0 - t
+            self._dx = -int(_BRANCH_SHIFT * t)
+            self.update()
+
+        def swap():
+            self._apply_repo(repo)
+            fade = QVariantAnimation(self)
+            fade.setDuration(_BRANCH_MS)
+            fade.setStartValue(0.0)
+            fade.setEndValue(1.0)
+            fade.setEasingCurve(QEasingCurve.OutCubic)
+
+            def f_in(t: float):
+                self._alpha = t
+                self._dx = int(_BRANCH_SHIFT * (1.0 - t))
+                self.update()
+
+            def finish():
+                self._alpha = 1.0
+                self._dx = 0
+                if self._anim is fade:
+                    self._anim = None
+                self.update()
+
+            fade.valueChanged.connect(f_in)
+            fade.finished.connect(finish)
+            fade.start()
+            self._anim = fade
+
+        out.valueChanged.connect(f_out)
+        out.finished.connect(swap)
+        out.start()
+        self._anim = out
+
+    def _apply_repo(self, repo: RepoInfo):
+        self.repo = repo
+        self.setFixedHeight(_row_height(repo))
+        self.arrow.setVisible(_pushable(repo))
+        self.chip.setVisible(len(repo.branches) > 1)
+        self._relayout()
+        self.update()
 
     def enterEvent(self, e):
         self._hover = True
@@ -361,6 +683,11 @@ class RepoRow(QWidget):
             # 直角高亮，与右侧按钮区域一致
             p.drawRect(0, 0, w, h)
 
+        # 分支切换过渡：内容整体淡入淡出并轻微横移，背景与右侧按钮不受影响
+        p.save()
+        p.setOpacity(self._alpha)
+        p.translate(self._dx, 0)
+
         self._paint_icon(p, QRect(16, 14, 40, 40), dark)
 
         name_w = w - 70 - 74
@@ -380,28 +707,44 @@ class RepoRow(QWidget):
             p.setBrush(_ORANGE)
             p.drawEllipse(QRectF(dot_x, 18, 6, 6))
 
-        f_sub = QFont(self.font())
-        f_sub.setPointSize(8)
+        f_sub = _pt_font(self.font(), 8)
         p.setFont(f_sub)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(70, 31, name_w, 15), Qt.AlignVCenter | Qt.AlignLeft,
                    _elide(p, str(self.repo.path), name_w))
 
-        # 分支胶囊 + 本地最新提交
-        chip_font = QFont(self.font())
-        chip_font.setPointSize(8)
-        chip_font.setBold(True)
-        chip_w = _text_width(chip_font, self.repo.branch) + 16
+        # 分支胶囊（可切换时胶囊内含下拉箭头） + 本地最新提交
+        chip_font = _chip_font(self.font())
+        multi = len(self.repo.branches) > 1
+        locked = self.chip._locked
+        chip_w = self._chip_width()
         chip = QRectF(70, 51, chip_w, 18)
         accent = theme.st("accent", dark)
         chip_bg = QColor(accent)
-        chip_bg.setAlpha(28)
+        if locked:
+            chip_bg = QColor(theme.st("sub_text", dark))
+            chip_bg.setAlpha(20)
+        elif self.chip._hover:
+            chip_bg.setAlpha(46 if dark else 34)
+        else:
+            chip_bg.setAlpha(28)
         p.setPen(Qt.NoPen)
         p.setBrush(chip_bg)
         p.drawRoundedRect(chip, 9, 9)
         p.setFont(chip_font)
-        p.setPen(accent)
-        p.drawText(chip, Qt.AlignCenter, self.repo.branch)
+        p.setPen(theme.st("sub_text", dark) if locked else accent)
+        text_rect = QRectF(chip.left(), chip.top(),
+                           chip.width() - (_CARET_W if multi else 0), chip.height())
+        p.drawText(text_rect, Qt.AlignCenter, self.repo.branch)
+
+        if multi:
+            # 与胶囊同色的下拉箭头，紧跟文字右侧
+            cx = chip.right() - 9
+            cy = chip.center().y()
+            p.setPen(QPen(theme.st("sub_text", dark) if locked else accent, 1.3,
+                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawLine(QPointF(cx - 3.4, cy - 1.4), QPointF(cx, cy + 2.2))
+            p.drawLine(QPointF(cx, cy + 2.2), QPointF(cx + 3.4, cy - 1.4))
 
         p.setFont(f_sub)
         p.setPen(theme.st("sub_text", dark))
@@ -424,6 +767,7 @@ class RepoRow(QWidget):
 
         p.setPen(theme.st("panel_border", dark))
         p.drawLine(16, h - 1, w - 16, h - 1)
+        p.restore()
         p.end()
 
     def _paint_icon(self, p: QPainter, rect: QRect, dark: bool):
@@ -479,6 +823,14 @@ def _pt_font(base: QFont, pt: int, bold: bool = False) -> QFont:
 def _text_width(font: QFont, text: str) -> int:
     """用与绘制一致的字体量文字宽度（分支胶囊自适应宽度用）。"""
     return QFontMetrics(font).horizontalAdvance(text)
+
+
+def _chip_font(base: QFont) -> QFont:
+    """分支胶囊字体：绘制与量宽度必须一致，否则箭头位置会偏。"""
+    f = QFont(base)
+    f.setPointSize(8)
+    f.setBold(True)
+    return f
 
 
 class EmptyState(QWidget):
@@ -687,10 +1039,15 @@ class ActionPad(QWidget):
     def set_enabled(self, confirm: bool, cancel: bool):
         self.confirm_enabled, self.cancel_enabled = confirm, cancel
         self._hover = -1
+        self.setCursor(Qt.PointingHandCursor if (confirm or cancel) else Qt.ArrowCursor)
         self.update()
 
     def _cell_at(self, pos) -> int:
-        return 0 if pos.y() < self.height() / 2 else 1
+        idx = 0 if pos.y() < self.height() / 2 else 1
+        # 锁死（忙碌中）的格子不参与悬浮：既不亮也不出指针光标
+        if not (self.confirm_enabled, self.cancel_enabled)[idx]:
+            return -1
+        return idx
 
     def mouseMoveEvent(self, e):
         idx = self._cell_at(e.position())
@@ -920,6 +1277,8 @@ class RepoPage(QWidget):
         self._detail_index = -1
         self._holder: QWidget | None = None
         self._layout: QVBoxLayout | None = None
+        # 用户在条目里切换过的分支：刷新/推送后仍按该分支显示
+        self._branch_choice: dict[str, str] = {}
 
         # 仓库来源由「仓库」页维护；旧版只有一个扫描目录，首次运行时迁入来源列表
         self._sources = store.repo_sources()
@@ -1091,7 +1450,7 @@ class RepoPage(QWidget):
         self._phase_timer.stop()
         self.refresh_btn.set_accept(bool(self._sources))
         if rebuild:
-            self._repos = sorted(repos, key=_repo_order)
+            self._repos = sorted(self._apply_branch_choices(repos), key=_repo_order)
             self._rebuild_rows()
 
         if self._repos:
@@ -1133,14 +1492,53 @@ class RepoPage(QWidget):
         for repo in self._repos:
             row = RepoRow(repo, holder)
             row.open_requested.connect(self._open_detail)
+            row.branch_requested.connect(self._switch_branch)
             lay.addWidget(row)
         lay.addStretch(1)
         self.scroll.setWidget(holder)
         self._holder = holder
         self._layout = lay
 
+    def _apply_branch_choices(self, repos: list) -> list:
+        """刷新后仍按用户选过的分支显示；分支已不存在时回退到默认分支。"""
+        if not self._branch_choice:
+            return repos
+        out = []
+        for repo in repos:
+            key = str(repo.path).lower()
+            branch = self._branch_choice.get(key)
+            if branch is not None and branch != repo.branch:
+                info = gitrepo.read_repo(repo.path, branch)
+                if info is not None:
+                    out.append(info)
+                    continue
+                self._branch_choice.pop(key, None)
+            out.append(repo)
+        return out
+
+    def _switch_branch(self, row: RepoRow, branch: str):
+        """条目内切换分支：读取该分支状态并做过渡动画，不改变工作区分支。"""
+        if self._detail is not None and self._detail.busy:
+            return
+        if branch == row.repo.branch:
+            return
+        info = gitrepo.read_repo(row.repo.path, branch)
+        if info is None:
+            return
+        self._branch_choice[str(row.repo.path).lower()] = branch
+        self._repos = [info if r.path == row.repo.path else r for r in self._repos]
+        # 首页读的是共享缓存，同步过去才能保持一致
+        scan_service().update_repo(info.path, info)
+        row.set_repo(info)
+
     def _update_repo(self, path: Path):
-        info = gitrepo.read_repo(path)
+        key = str(path).lower()
+        info = gitrepo.read_repo(path, self._branch_choice.get(key))
+        if info is None and key in self._branch_choice:
+            self._branch_choice.pop(key, None)
+            info = gitrepo.read_repo(path)
+        # 同步共享缓存：首页直接读缓存，否则推送后汇总数字仍是旧值
+        scan_service().update_repo(path, info)
         if info is None:
             self._repos = [r for r in self._repos if r.path != path]
         else:
@@ -1274,6 +1672,7 @@ class RepoPage(QWidget):
             self._detail = None
             self._detail_row = None
             self._detail_index = -1
+            self._set_rows_locked(False)
             if row is not None:
                 row.setGraphicsEffect(None)
                 row.show()
@@ -1349,11 +1748,20 @@ class RepoPage(QWidget):
         self.setFocus()
 
     # ---------- 推送流程 ----------
+    def _set_rows_locked(self, locked: bool):
+        """推送进行中锁死其它条目的箭头，避免中途切换项目。"""
+        if self._holder is None:
+            return
+        for row in self._holder.findChildren(RepoRow):
+            row.arrow.set_locked(locked)
+            row.chip.set_locked(locked)
+
     def _on_confirm(self, remote: RemoteBranch):
         detail = self._detail
         if detail is None:
             return
         detail.set_busy(True)
+        self._set_rows_locked(True)
         if not store.sensitive_verify_required():
             # 「安全」里关闭了敏感操作二次校验：直接推送
             detail.set_status(f"正在推送到 {remote.remote}…", "busy")
@@ -1463,6 +1871,7 @@ class RepoPage(QWidget):
             return
         if not result.ok:
             detail.set_busy(False)
+            self._set_rows_locked(False)
             detail.set_status(f"{result.message}，可重新验证或取消", "error")
             return
         detail.set_status(f"验证通过，正在推送到 {remote.remote}…", "busy")
@@ -1483,6 +1892,7 @@ class RepoPage(QWidget):
     def _on_push_error(self, _err):
         if self._detail is not None and self._detail.busy:
             self._detail.set_busy(False)
+            self._set_rows_locked(False)
             self._detail.set_status("无法启动 git，请确认已安装并加入 PATH", "error")
 
     def _on_push_finished(self, remote: RemoteBranch, code: int):
@@ -1499,6 +1909,7 @@ class RepoPage(QWidget):
             return
 
         detail.set_busy(False)
+        self._set_rows_locked(False)
         reason = _brief_error(out + "\n" + err)
         detail.set_status(f"推送失败：{reason}", "error")
 
@@ -1550,36 +1961,51 @@ class SourceRow(QWidget):
     """「仓库」页的一行来源：类型徽标 + 名称与路径 + 右侧删除按钮。"""
 
     remove_requested = Signal(str, str)   # (path, kind)
+    toggle_requested = Signal(str, str)   # (path, kind) 目录来源的展开/收起
 
     H = 58
 
-    def __init__(self, path: str, kind: str, parent=None):
+    def __init__(self, path: str, kind: str, parent=None,
+                 count: int | None = None, expanded: bool = True):
         super().__init__(parent)
         self.path, self.kind = path, kind
+        self.count = count          # 目录来源下的仓库数；None 表示尚未扫描完
+        self.expanded = expanded
         self._hot_remove = False
+        self._hot_row = False
         self.setFixedHeight(self.H)
         self.setMouseTracking(True)
 
     def _remove_rect(self) -> QRectF:
         return QRectF(self.width() - 46, (self.height() - 26) / 2, 26, 26)
 
+    def _has_toggle(self) -> bool:
+        return self.kind == "folder" and bool(self.count)
+
     def mouseMoveEvent(self, e):
-        hot = self._remove_rect().contains(e.position())
-        if hot != self._hot_remove:
-            self._hot_remove = hot
-            self.setCursor(Qt.PointingHandCursor if hot else Qt.ArrowCursor)
+        hot_remove = self._remove_rect().contains(e.position())
+        hot_row = self._has_toggle() and not hot_remove
+        if (hot_remove, hot_row) != (self._hot_remove, self._hot_row):
+            self._hot_remove, self._hot_row = hot_remove, hot_row
+            self.setCursor(Qt.PointingHandCursor if (hot_remove or hot_row)
+                           else Qt.ArrowCursor)
             self.update()
         super().mouseMoveEvent(e)
 
     def leaveEvent(self, e):
         self._hot_remove = False
+        self._hot_row = False
         self.unsetCursor()
         self.update()
         super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self._remove_rect().contains(e.position()):
-            self.remove_requested.emit(self.path, self.kind)
+        if e.button() == Qt.LeftButton:
+            if self._remove_rect().contains(e.position()):
+                self.remove_requested.emit(self.path, self.kind)
+            elif self._has_toggle():
+                # 整行都是展开/收起的点击区，不再单独设按钮
+                self.toggle_requested.emit(self.path, self.kind)
         super().mouseReleaseEvent(e)
 
     def paintEvent(self, _):
@@ -1587,6 +2013,11 @@ class SourceRow(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         dark = _is_dark(self)
         w, h = self.width(), self.height()
+
+        if self._hot_row:
+            p.setPen(Qt.NoPen)
+            p.setBrush(theme.st("nav_hover", dark))
+            p.drawRect(0, 0, w, h)
 
         accent = theme.st("accent", dark)
         badge_w, badge_h = 46.0, 20.0
@@ -1618,8 +2049,13 @@ class SourceRow(QWidget):
         f.setBold(False)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
-        p.drawText(QRectF(text_x, 29, text_w, 16), Qt.AlignVCenter | Qt.AlignLeft,
-                   _elide(p, self.path, text_w))
+        path_w = text_w - 76 if self.kind == "folder" else text_w
+        p.drawText(QRectF(text_x, 29, path_w, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, self.path, path_w))
+        if self.kind == "folder":
+            label = "扫描中…" if self.count is None else f"{self.count} 个仓库"
+            p.drawText(QRectF(text_x + path_w, 29, 76, 16),
+                       Qt.AlignVCenter | Qt.AlignRight, label)
 
         # 删除按钮
         rr = self._remove_rect()
@@ -1638,6 +2074,121 @@ class SourceRow(QWidget):
         p.end()
 
 
+class SourceRepoRow(QWidget):
+    """目录来源下的二级条目：树形引导线 + 仓库名 + 分支 + 推送状态。"""
+
+    H = 40
+
+    def __init__(self, repo: RepoInfo, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.setFixedHeight(self.H)
+
+    def _status(self, dark) -> tuple[str, QColor]:
+        """汇总各远程的状态，用一行文案表示。"""
+        if not self.repo.remotes:
+            return "未配置远程", theme.st("sub_text", dark)
+        ahead = max((r.ahead for r in self.repo.remotes), default=0)
+        behind = max((r.behind for r in self.repo.remotes), default=0)
+        if any(not r.exists for r in self.repo.remotes):
+            return "未推送", _ORANGE
+        if ahead and behind:
+            return f"↑{ahead} ↓{behind}", _GREEN
+        if ahead:
+            return f"↑{ahead}", _GREEN
+        if behind:
+            return f"↓{behind}", _ORANGE
+        return "已同步", _GREEN
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = _is_dark(self)
+        w, h = self.width(), self.height()
+
+        # 树形引导线：与父级徽标的中心对齐
+        guide = theme.st("panel_border", dark)
+        p.setPen(QPen(guide, 1))
+        p.drawLine(QPointF(39, 0), QPointF(39, h))
+        p.drawLine(QPointF(39, h / 2), QPointF(51, h / 2))
+
+        # 状态文案（右对齐）
+        text, color = self._status(dark)
+        f = QFont(self.font())
+        f.setPointSize(8)
+        p.setFont(f)
+        p.setPen(color)
+        p.drawText(QRectF(w - 122, 0, 106, h), Qt.AlignVCenter | Qt.AlignRight, text)
+
+        # 仓库名
+        f.setPointSize(9)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(theme.st("title_text", dark))
+        name_rect = QRectF(56, 0, w - 56 - 122 - 96, h)
+        name = _elide(p, self.repo.name, name_rect.width())
+        p.drawText(name_rect, Qt.AlignVCenter | Qt.AlignLeft, name)
+
+        # 分支胶囊
+        chip_font = _chip_font(self.font())
+        chip_font.setPointSize(7)
+        chip_w = _text_width(chip_font, self.repo.branch) + 12
+        chip = QRectF(56 + p.fontMetrics().horizontalAdvance(name) + 10,
+                      (h - 16) / 2, chip_w, 16)
+        if chip.right() > w - 130:
+            p.end()
+            return
+        accent = theme.st("accent", dark)
+        chip_bg = QColor(accent)
+        chip_bg.setAlpha(24)
+        p.setPen(Qt.NoPen)
+        p.setBrush(chip_bg)
+        p.drawRoundedRect(chip, 8, 8)
+        p.setFont(chip_font)
+        p.setPen(accent)
+        p.drawText(chip, Qt.AlignCenter, self.repo.branch)
+        p.end()
+
+
+class OverlayScrollBar(QScrollBar):
+    """浮在滚动区右侧的细滚动条：不占布局宽度，出现/消失都不会挤压内容。"""
+
+    WIDTH = 8
+
+    def __init__(self, area: QScrollArea):
+        super().__init__(Qt.Vertical, area)
+        self._area = area
+        self.setFixedWidth(self.WIDTH)
+        src = area.verticalScrollBar()
+        src.rangeChanged.connect(self._sync)
+        src.valueChanged.connect(self._from_area)
+        self.valueChanged.connect(self._to_area)
+        self.hide()
+
+    def resize_to_area(self):
+        a = self._area
+        self.setGeometry(a.width() - self.WIDTH - 6, 6,
+                         self.WIDTH, max(24, a.height() - 12))
+        self.raise_()
+
+    def _sync(self, lo: int, hi: int):
+        src = self._area.verticalScrollBar()
+        self.setRange(lo, hi)
+        self.setPageStep(src.pageStep())
+        self.setSingleStep(src.singleStep())
+        self.resize_to_area()
+        self.setVisible(hi > lo)
+
+    def _from_area(self, value: int):
+        if self.value() != value:
+            self.setValue(value)
+
+    def _to_area(self, value: int):
+        src = self._area.verticalScrollBar()
+        if src.value() != value:
+            src.setValue(value)
+
+
 class SourcesPage(QWidget):
     """仓库页：登记单个仓库目录，或添加整个文件夹自动扫描，可添加多个。"""
 
@@ -1653,8 +2204,11 @@ class SourcesPage(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 原生滚动条改为浮层：不占布局宽度，避免出现时把条目挤窄
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.viewport().setAutoFillBackground(False)
+        self._vbar = OverlayScrollBar(self.scroll)
+        self.scroll.installEventFilter(self)
 
         self.empty = EmptyState(self, "添加文件夹")
         self.empty.btn.clicked.connect(self._add_dir)
@@ -1662,7 +2216,29 @@ class SourcesPage(QWidget):
 
         self._holder: QWidget | None = None
         self._last_dir = str(Path.home())
+        self._collapsed: set[str] = set()   # 已收起的目录来源（按规范化路径记）
+        self._boxes: dict[str, QWidget] = {}          # 目录 → 子条目容器
+        self._folder_rows: dict[str, SourceRow] = {}  # 目录 → 一级条目
+        self._box_anims: dict[str, QVariantAnimation] = {}
+        # 与推送页共用同一份扫描结果，目录下有哪些仓库直接从缓存取
+        scan_service().finished.connect(self._on_scan_done)
+        scan_service().changed.connect(self._on_scan_done)
         self.apply_style()
+        self._rebuild()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if store.repo_sources():
+            scan_service().ensure()
+        self._rebuild()
+        self._vbar.resize_to_area()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.scroll and ev.type() == QEvent.Resize:
+            self._vbar.resize_to_area()
+        return super().eventFilter(obj, ev)
+
+    def _on_scan_done(self, _repos):
         self._rebuild()
 
     def _panel_rect(self) -> QRect:
@@ -1711,7 +2287,12 @@ class SourcesPage(QWidget):
         p.drawRoundedRect(QRectF(panel).adjusted(0.5, 0.5, -0.5, -0.5), r, r)
 
         sources = store.repo_sources()
-        bar_text = f"已添加 {len(sources)} 项" if sources else "尚未添加仓库或目录"
+        if sources and scan_service().scanning():
+            bar_text = f"正在扫描 · 已添加 {len(sources)} 项"
+        elif sources:
+            bar_text = f"已添加 {len(sources)} 项"
+        else:
+            bar_text = "尚未添加仓库或目录"
         f.setPointSize(8)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
@@ -1726,12 +2307,16 @@ class SourcesPage(QWidget):
 
     def apply_style(self):
         dark = _is_dark(self)
-        handle = theme.st("sub_text", dark).name()
+        # 浮层滚动条用半透明中性色，避免在浅/深色面板上显得突兀
+        sub = theme.st("sub_text", dark)
+        handle = f"rgba({sub.red()}, {sub.green()}, {sub.blue()}, 100)"
+        handle_hot = f"rgba({sub.red()}, {sub.green()}, {sub.blue()}, 170)"
         self.scroll.setStyleSheet(f"""
             QScrollArea {{ background: transparent; border: none; }}
             QScrollBar:vertical {{ width: 8px; background: transparent; margin: 2px 0; }}
             QScrollBar::handle:vertical {{ background: {handle}; border-radius: 4px;
-                                          min-height: 28px; }}
+                                          min-height: 32px; }}
+            QScrollBar::handle:vertical:hover {{ background: {handle_hot}; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
                 background: transparent; }}
@@ -1741,6 +2326,8 @@ class SourcesPage(QWidget):
         self.empty.update()
         if self._holder is not None:
             for row in self._holder.findChildren(SourceRow):
+                row.update()
+            for row in self._holder.findChildren(SourceRepoRow):
                 row.update()
         self.update()
 
@@ -1756,6 +2343,7 @@ class SourcesPage(QWidget):
             return
         self._last_dir = picked
         if add_source(picked, "repo"):
+            scan_service().ensure()
             self._rebuild()
 
     def _add_dir(self):
@@ -1764,31 +2352,146 @@ class SourcesPage(QWidget):
             return
         self._last_dir = picked
         if add_source(picked, "folder"):
+            scan_service().ensure()
             self._rebuild()
+
+    @staticmethod
+    def _key(path: str) -> str:
+        """来源路径的规范化键：用于记住某个目录的展开/收起状态。"""
+        try:
+            return str(Path(path).resolve()).lower()
+        except OSError:
+            return path.lower()
+
+    def _toggle(self, path: str, kind: str):
+        key = self._key(path)
+        collapsed = key not in self._collapsed
+        if collapsed:
+            self._collapsed.add(key)
+        else:
+            self._collapsed.discard(key)
+        row = self._folder_rows.get(key)
+        if row is not None:
+            row.expanded = not collapsed
+            row.update()
+        box = self._boxes.get(key)
+        if box is not None:
+            self._animate_box(key, box, not collapsed)
+
+    def _animate_box(self, key: str, box: QWidget, expanded: bool):
+        """高度与透明度同步过渡（200ms OutCubic）：收起时子条目一起淡出，不会堆叠。"""
+        old = self._box_anims.get(key)
+        if old is not None:
+            old.stop()
+            self._box_anims.pop(key, None)
+
+        eff = box.graphicsEffect()
+        if not isinstance(eff, QGraphicsOpacityEffect):
+            eff = QGraphicsOpacityEffect(box)
+            box.setGraphicsEffect(eff)
+
+        start_h = box.height() if box.isVisible() else 0
+        start_o = eff.opacity() if box.isVisible() else 0.0
+        end_h = box.layout().sizeHint().height() if expanded else 0
+        end_o = 1.0 if expanded else 0.0
+
+        box.setMaximumHeight(int(start_h))
+        eff.setOpacity(start_o)
+        if expanded and not box.isVisible():
+            box.show()
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(_FOLD_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        def step(t):
+            box.setMaximumHeight(int(start_h + (end_h - start_h) * t))
+            eff.setOpacity(start_o + (end_o - start_o) * t)
+
+        anim.valueChanged.connect(step)
+
+        def done():
+            self._box_anims.pop(key, None)
+            if expanded:
+                box.setMaximumHeight(_BOX_MAX)
+                eff.setOpacity(1.0)
+            else:
+                box.setMaximumHeight(0)
+                eff.setOpacity(0.0)
+                box.hide()
+
+        anim.finished.connect(done)
+        self._box_anims[key] = anim
+        anim.start()
 
     def _remove(self, path: str, kind: str):
         remove_source(path, kind)
-        self._rebuild()
+        self._collapsed.discard(self._key(path))
+        scan_service().ensure()
+        # 删除按钮本身就在被删的行里，延后一帧重建，避免行在自己的事件里被销毁
+        QTimer.singleShot(0, self._rebuild)
 
     def _rebuild(self):
+        # 先停掉还在跑的展开/收起动画，避免它们操作即将销毁的控件
+        for anim in self._box_anims.values():
+            anim.stop()
+        self._box_anims.clear()
+        self._boxes.clear()
+        self._folder_rows.clear()
+
         if self._holder is not None:
             self._holder.deleteLater()
             self._holder = None
 
+        scroll_val = self.scroll.verticalScrollBar().value()
         sources = store.repo_sources()
+        repos = scan_service().repos()
+        scanning = scan_service().scanning()
+
         holder = QWidget()
         holder.setStyleSheet("background: transparent;")
         lay = QVBoxLayout(holder)
         lay.setContentsMargins(0, 4, 0, 4)
         lay.setSpacing(0)
         for src in sources:
-            row = SourceRow(src["path"], src["kind"], holder)
+            path = Path(src["path"])
+            key = self._key(src["path"])
+            if src["kind"] == "folder":
+                children = sorted((r for r in repos if _path_under(r.path, path)),
+                                  key=lambda r: r.name.casefold())
+                expanded = key not in self._collapsed
+                row = SourceRow(src["path"], src["kind"], holder,
+                                None if scanning else len(children), expanded)
+                lay.addWidget(row)
+
+                # 子条目放在独立容器里，收起时只压缩该容器的高度
+                box = QWidget(holder)
+                box.setStyleSheet("background: transparent;")
+                bl = QVBoxLayout(box)
+                bl.setContentsMargins(0, 0, 0, 0)
+                bl.setSpacing(0)
+                for repo in children:
+                    bl.addWidget(SourceRepoRow(repo, box))
+                if expanded:
+                    box.setMaximumHeight(_BOX_MAX)
+                else:
+                    box.setMaximumHeight(0)
+                    box.hide()
+                lay.addWidget(box)
+                self._boxes[key] = box
+                self._folder_rows[key] = row
+            else:
+                row = SourceRow(src["path"], src["kind"], holder, None)
+                lay.addWidget(row)
             row.remove_requested.connect(self._remove)
-            lay.addWidget(row)
+            row.toggle_requested.connect(self._toggle)
         lay.addStretch(1)
 
         self.scroll.setWidget(holder)
         self._holder = holder
+        self.scroll.verticalScrollBar().setValue(scroll_val)
         if sources:
             self.empty.hide()
             self.scroll.show()
@@ -1808,6 +2511,7 @@ class HomePage(QWidget):
         self._scanning = False
         # 与推送页共用同一次扫描，切页不会重复跑 git
         scan_service().finished.connect(self._on_scan_done)
+        scan_service().changed.connect(self._on_scan_done)
 
     def _metrics(self) -> tuple[int, int, int, int]:
         repos = self._repos

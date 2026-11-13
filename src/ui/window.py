@@ -1299,6 +1299,16 @@ class AppWindow(QWidget):
         self._switch_anim = None
         self._switch_widgets = None
 
+    def paintEvent(self, e):
+        """整窗底色：高 DPI 下侧栏与内容区之间会留下半像素缝隙，
+        不铺底色时缝隙会露出系统深色背景，在浅色下表现为一条黑线。"""
+        p = QPainter(self)
+        dark = is_dark(self)
+        p.fillRect(self.rect(), theme.st("content_bg", dark))
+        p.fillRect(QRect(0, 0, self.sidebar.width(), self.height()),
+                   theme.st("sidebar_bg", dark))
+        p.end()
+
     def showEvent(self, e):
         super().showEvent(e)
         if not self._opened:
@@ -1437,7 +1447,7 @@ class AppWindow(QWidget):
         # 必须等 frame 重算事件流处理完（geometry 还原为真实客户区）后再同步。
         QTimer.singleShot(0, self._adapt_min_size)
         # 全量重绘：侧栏、各内容页、红绿灯、设置卡
-        for w in [self.sidebar, self.settings_page, self.stack] + list(self.pages.values()):
+        for w in [self, self.sidebar, self.settings_page, self.stack] + list(self.pages.values()):
             w.update()
         if self.repo_page is not None:
             self.repo_page.apply_style()
@@ -1487,7 +1497,7 @@ class AppWindow(QWidget):
             return
         QApplication.instance().setStyleSheet(apply_style())
         # 全量重绘：侧栏、各内容页、红绿灯、设置卡；深浅色不影响窗口框架，无须重算非客户区
-        for w in [self.sidebar, self.settings_page, self.stack] + list(self.pages.values()):
+        for w in [self, self.sidebar, self.settings_page, self.stack] + list(self.pages.values()):
             w.update()
         if self.repo_page is not None:
             self.repo_page.apply_style()

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # 扫描时直接剪掉的目录：不可能作为仓库根，且通常体积很大
@@ -48,6 +48,7 @@ class RepoInfo:
     head_subject: str
     dirty: bool
     remotes: list[RemoteBranch]
+    branches: list[str] = field(default_factory=list)   # 本地分支（含当前分支）
 
     @property
     def pushable_remotes(self) -> list[RemoteBranch]:
@@ -120,9 +121,9 @@ def _parse_remote_refs(raw: str) -> tuple[dict[tuple[str, str], tuple[str, str]]
     return refs, heads
 
 
-def _divergence(repo: Path, ref: str) -> tuple[int, int] | None:
+def _divergence(repo: Path, ref: str, local: str = "HEAD") -> tuple[int, int] | None:
     """返回 (本地领先, 本地落后) 提交数。"""
-    ok, out = _git(repo, "rev-list", "--left-right", "--count", f"HEAD...{ref}")
+    ok, out = _git(repo, "rev-list", "--left-right", "--count", f"{local}...{ref}")
     if not ok:
         return None
     parts = out.split()
@@ -134,25 +135,44 @@ def _divergence(repo: Path, ref: str) -> tuple[int, int] | None:
         return None
 
 
-def read_repo(path: Path) -> RepoInfo | None:
-    """读取单个仓库的当前状态；空仓库或无提交时返回 None。"""
+def local_branches(path: Path) -> list[str]:
+    """列出本地分支名（按 git 默认排序，当前分支不一定在最前）。"""
+    ok, out = _git(Path(path), "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    if not ok:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def read_repo(path: Path, branch: str | None = None) -> RepoInfo | None:
+    """读取单个仓库的状态；空仓库或无提交时返回 None。
+
+    branch 为 None 时读取当前分支；指定时按该本地分支读取提交与领先/落后数，
+    用于推送页里切换要查看/推送的分支。
+    """
     path = Path(path)
-    ok, head_short = _git(path, "rev-parse", "--short=7", "HEAD")
+
+    ok, current = _git(path, "symbolic-ref", "--short", "-q", "HEAD")
+    current = current if ok and current else ""
+    target = branch or current or "HEAD"
+
+    ok, head_short = _git(path, "rev-parse", "--short=7", target)
     if not ok:
         return None
 
-    ok, branch = _git(path, "symbolic-ref", "--short", "-q", "HEAD")
-    if not ok or not branch:
-        branch = f"detached@{head_short}"
+    if branch is None:
+        branch = current or f"detached@{head_short}"
 
-    ok, log_line = _git(path, "log", "-1", "--format=%h%x1f%s")
+    ok, log_line = _git(path, "log", "-1", "--format=%h%x1f%s", target)
     head_subject = ""
     if ok and _FIELD_SEP in log_line:
         head_short, head_subject = log_line.split(_FIELD_SEP, 1)
 
     # 不统计未跟踪文件：大型仓库下 status 会明显变慢，已跟踪改动足够标示“有修改”
-    ok, status = _git(path, "status", "--porcelain", "--untracked-files=no")
-    dirty = ok and bool(status)
+    # 未检出的分支没有工作区，不显示改动标记
+    dirty = False
+    if branch == current:
+        ok, status = _git(path, "status", "--porcelain", "--untracked-files=no")
+        dirty = ok and bool(status)
 
     ok, remote_raw = _git(path, "remote")
     remotes = [r for r in remote_raw.splitlines() if r] if ok else []
@@ -174,7 +194,7 @@ def read_repo(path: Path) -> RepoInfo | None:
         cached = refs.get((remote, branch))
         if cached is not None:
             short, subject = cached
-            delta = _divergence(path, ref)
+            delta = _divergence(path, ref, target)
             ahead, behind = delta if delta else (0, 0)
             remote_branches.append(RemoteBranch(
                 remote, branch, True, short, subject, ahead, behind,
@@ -185,10 +205,10 @@ def read_repo(path: Path) -> RepoInfo | None:
         ahead = 0
         head_ref = heads.get(remote)
         if head_ref:
-            ok, count = _git(path, "rev-list", "--count", f"{remote}/HEAD..HEAD")
+            ok, count = _git(path, "rev-list", "--count", f"{remote}/HEAD..{target}")
             ahead = int(count) if ok and count.isdigit() else 0
         if not ahead:
-            ok, count = _git(path, "rev-list", "--count", "HEAD")
+            ok, count = _git(path, "rev-list", "--count", target)
             ahead = int(count) if ok and count.isdigit() else 0
         remote_branches.append(RemoteBranch(
             remote, branch, False, "", "", ahead, 0,
@@ -202,6 +222,7 @@ def read_repo(path: Path) -> RepoInfo | None:
         head_subject=head_subject,
         dirty=dirty,
         remotes=remote_branches,
+        branches=local_branches(path),
     )
 
 
