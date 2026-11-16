@@ -36,27 +36,17 @@ jobs:
           }
           "VERSION=$ver" >> $env:GITHUB_ENV
 
-      - name: 安装 Inno Setup 6.7.4 与简体中文语言文件
+      - name: 准备 Inno Setup 与简体中文语言文件
         shell: pwsh
         run: |
-          # 固定版本，避免 choco/latest 漂移到 Inno Setup 7
-          $ProgressPreference = 'SilentlyContinue'
-          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe"
-          $exe = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-          Start-Process -FilePath $exe -Wait -ArgumentList `
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"
-
-          $iscc = @(
-            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-            "C:\Program Files\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $iscc) { throw "Inno Setup 6.7.4 安装后未找到 ISCC.exe" }
-          $ver = (Get-Item $iscc).VersionInfo.ProductVersion
-          if ($ver -notlike "6.7.4*") { throw "Inno Setup 版本不符：$ver" }
-          "ISCC=$iscc" >> $env:GITHUB_ENV
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC.exe（C:\Program Files (x86)\Inno Setup 6）" }
           Copy-Item "$env:GITHUB_WORKSPACE\.github\ci\windows\ChineseSimplified.isl" `
-            (Join-Path (Split-Path $iscc) "Languages\ChineseSimplified.isl") -Force
+            "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl" -Force
+          "ISCC=$iscc" >> $env:GITHUB_ENV
 
       - name: 安装依赖
         shell: pwsh
