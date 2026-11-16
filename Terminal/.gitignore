@@ -1,9 +1,0 @@
-__pycache__/
-.idea/
-.vs/
-output/
-.md/
-dist/
-
-*.exe
-*.bat

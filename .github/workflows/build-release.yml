@@ -1,0 +1,141 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'R*'
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: GiTool
+  WIN_ASSET: GiTool_Setup.exe
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 校验标签与版本号
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME -replace '^R', ''
+          $cfg = (Get-Content src\core\config.py -Raw |
+            Select-String -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          if (-not $cfg) {
+            throw "未能在 src\core\config.py 中读取 APP_VERSION"
+          }
+          if ($cfg -ne $ver) {
+            throw "config.py 的 APP_VERSION（$cfg）与标签 R$ver 不一致，请先提交版本号再打标签"
+          }
+          "VERSION=$ver" >> $env:GITHUB_ENV
+
+      - name: 安装 Inno Setup 6.7.4 与简体中文语言文件
+        shell: pwsh
+        run: |
+          # 固定版本，避免 choco/latest 漂移到 Inno Setup 7
+          $ProgressPreference = 'SilentlyContinue'
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe"
+          $exe = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          Start-Process -FilePath $exe -Wait -ArgumentList `
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"
+
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup 6.7.4 安装后未找到 ISCC.exe" }
+          $ver = (Get-Item $iscc).VersionInfo.ProductVersion
+          if ($ver -notlike "6.7.4*") { throw "Inno Setup 版本不符：$ver" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+          Copy-Item "$env:GITHUB_WORKSPACE\.github\ci\windows\ChineseSimplified.isl" `
+            (Join-Path (Split-Path $iscc) "Languages\ChineseSimplified.isl") -Force
+
+      - name: 安装依赖
+        shell: pwsh
+        run: python -m pip install --upgrade pip; pip install -r requirements.txt "nuitka==4.3.5"
+
+      - name: Nuitka 打包（目录版）
+        shell: pwsh
+        working-directory: nuitka
+        run: |
+          $ver = $env:VERSION
+          $na = @(
+            '-u', '-m', 'nuitka',
+            '--standalone',
+            '--assume-yes-for-downloads',
+            '--windows-console-mode=disable',
+            '--noinclude-pytest-mode=nofollow',
+            '--noinclude-setuptools-mode=nofollow',
+            '--noinclude-unittest-mode=nofollow',
+            '--enable-plugin=pyside6',
+            '--include-package=winrt',
+            '--include-package-data=winrt',
+            '--output-dir=.\dist',
+            '--windows-icon-from-ico=..\icon.ico',
+            '--include-data-file=..\icon.ico=icon.ico',
+            '--product-name=GiTool',
+            '--file-description=GiTool',
+            "--product-version=$ver",
+            "--file-version=$ver",
+            '--copyright=Copyright (c) 2026 Lisselde_E',
+            '--remove-output',
+            '--show-progress',
+            '--show-memory',
+            '--jobs=4',
+            '--zig',
+            '..\GiTool.py'
+          )
+          python @na
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Inno Setup 编译安装包
+        shell: pwsh
+        run: |
+          $iscc = $env:ISCC
+          & $iscc /Qp `
+            "/DMyAppVersion=$env:VERSION" `
+            "/DMyAppSrcDir=$env:GITHUB_WORKSPACE\nuitka\dist\GiTool.dist" `
+            "/DMyOutputDir=$env:GITHUB_WORKSPACE\nuitka\dist" `
+            "/DMyLicenseFile=$env:GITHUB_WORKSPACE\LICENSE" `
+            "/DMySetupIcon=$env:GITHUB_WORKSPACE\icon.ico" `
+            ".github\ci\windows\gitool_setup.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: nuitka/dist/${{ env.WIN_ASSET }}
+          if-no-files-found: error
+
+  release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          TITLE="GiTool_${GITHUB_REF_NAME}"
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$TITLE"
+          else
+            gh release create "$TAG" dist/* --title "$TITLE"
+          fi

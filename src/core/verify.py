@@ -11,6 +11,8 @@ import uuid
 from dataclasses import dataclass
 
 import winrt._winrt as wrt
+
+from .i18n import tr
 from winrt.windows.security.credentials.ui import (
     UserConsentVerificationResult,
     UserConsentVerifier,
@@ -51,7 +53,7 @@ def start_verification(message: str, hwnd: int) -> tuple[VerifyResult | None, "V
     try:
         return None, _open_for_window(int(hwnd), message)
     except Exception as exc:
-        return VerifyResult(False, "error", f"验证调用失败：{exc}"), None
+        return VerifyResult(False, "error", tr("验证调用失败：{err}", err=exc)), None
 
 
 class VerificationSession:
@@ -66,7 +68,7 @@ class VerificationSession:
         hr = query(op, ctypes.byref(_guid(_ASYNC_INFO_IID)), ctypes.byref(self._info))
         if hr < 0 or not self._info.value:
             self.release()
-            raise RuntimeError(f"获取异步状态接口失败（hr={hr}）")
+            raise RuntimeError(tr("获取异步状态接口失败（hr={hr}）", hr=hr))
 
     def status(self) -> int:
         """0=Started，1=Completed，2=Canceled，3=Error。"""
@@ -75,7 +77,7 @@ class VerificationSession:
                                 ctypes.POINTER(ctypes.c_int32))(
             _slot(self._info, _STATUS_INDEX))(self._info, ctypes.byref(status))
         if hr < 0:
-            raise RuntimeError(f"读取验证状态失败（hr={hr}）")
+            raise RuntimeError(tr("读取验证状态失败（hr={hr}）", hr=hr))
         return status.value
 
     def finish(self) -> VerifyResult:
@@ -85,13 +87,13 @@ class VerificationSession:
             if status == 2:
                 return _from_result(UserConsentVerificationResult.CANCELED)
             if status != 1:
-                return VerifyResult(False, "error", "验证过程出错")
+                return VerifyResult(False, "error", tr("验证过程出错"))
             value = ctypes.c_int32()
             hr = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p,
                                     ctypes.POINTER(ctypes.c_int32))(
                 _slot(self._op, _RESULT_INDEX))(self._op, ctypes.byref(value))
             if hr < 0:
-                return VerifyResult(False, "error", f"读取验证结果失败（hr={hr}）")
+                return VerifyResult(False, "error", tr("读取验证结果失败（hr={hr}）", hr=hr))
             return _from_result(UserConsentVerificationResult(value.value))
         finally:
             self.release()
@@ -107,9 +109,9 @@ class VerificationSession:
 
 def _from_result(result) -> VerifyResult:
     if result == UserConsentVerificationResult.VERIFIED:
-        return VerifyResult(True, "verified", "验证通过")
+        return VerifyResult(True, "verified", tr("验证通过"))
     code = "retries_exhausted" if result == UserConsentVerificationResult.RETRIES_EXHAUSTED else "failed"
-    return VerifyResult(False, code, _RESULT_MSG.get(result, "验证失败"))
+    return VerifyResult(False, code, tr(_RESULT_MSG.get(result, "验证失败")))
 
 
 # ---------- 底层 interop 调用（ctypes 直连 WinRT ABI） ----------
@@ -156,7 +158,7 @@ def _open_for_window(hwnd: int, message: str) -> VerificationSession:
     finally:
         _combase.WindowsDeleteString(hstr)
     if hr < 0 or not op.value:
-        raise RuntimeError(f"验证窗口调用失败（hr={hr}）")
+        raise RuntimeError(tr("验证窗口调用失败（hr={hr}）", hr=hr))
     return VerificationSession(op)
 
 

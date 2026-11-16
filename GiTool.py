@@ -6,7 +6,7 @@ import sys
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from src.core import store, theme
+from src.core import i18n, store, theme
 from src.core.config import Config
 from src.ui.window import AppWindow, apply_style
 
@@ -103,11 +103,22 @@ def _restore_prefs():
         theme.set_theme(data["theme"])
 
 
+def _clean_update_cache():
+    """启动时清空上次下载的更新包，失败不影响启动。"""
+    try:
+        from src.core.update import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
+
 def main():
     _set_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName(Config.APP_NAME)
     _restore_prefs()
+    i18n.initialize()
+    _clean_update_cache()
     app.setStyleSheet(apply_style())
 
     path = _icon_path()

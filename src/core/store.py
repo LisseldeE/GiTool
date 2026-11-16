@@ -82,3 +82,39 @@ def save_repo_sources(items: list[dict]) -> None:
 def sensitive_verify_required() -> bool:
     """敏感操作（推送、关闭保护本身）是否需要二次校验；默认关闭。"""
     return bool(get("sensitive_verify", False))
+
+
+def _repo_key(path: str) -> str:
+    """仓库配置的键：真实路径小写，避免盘符/分隔符差异导致读不到。"""
+    try:
+        return str(Path(path).resolve()).lower()
+    except OSError:
+        return str(path).lower()
+
+
+def repo_options(path: str) -> dict:
+    """单个仓库的附加配置（目前只有批量推送目标）。"""
+    raw = get("repo_options")
+    if not isinstance(raw, dict):
+        return {}
+    item = raw.get(_repo_key(path))
+    return item if isinstance(item, dict) else {}
+
+
+def save_push_remotes(path: str, names: list[str]) -> None:
+    """保存该仓库的批量推送目标（远程名列表）。"""
+    raw = get("repo_options")
+    data = dict(raw) if isinstance(raw, dict) else {}
+    key = _repo_key(path)
+    item = dict(data.get(key)) if isinstance(data.get(key), dict) else {}
+    item["push_remotes"] = list(names)
+    data[key] = item
+    set_value("repo_options", data)
+
+
+def push_remotes(path: str) -> list[str] | None:
+    """读取批量推送目标；从未配置时返回 None（由界面取默认值）。"""
+    raw = repo_options(path).get("push_remotes")
+    if not isinstance(raw, list):
+        return None
+    return [str(n) for n in raw if isinstance(n, str)]

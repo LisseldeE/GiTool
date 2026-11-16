@@ -10,6 +10,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .i18n import tr
+
 # 扫描时直接剪掉的目录：不可能作为仓库根，且通常体积很大
 _SKIP_DIRS = {
     "node_modules", ".venv", "venv", "env", "dist", "build", "out", "target",
@@ -76,6 +78,48 @@ def _git(repo: Path, *args: str, timeout: float = 10) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, ""
     return True, proc.stdout.strip()
+
+
+def global_config() -> dict[str, str]:
+    """读取全局 git 配置，返回小写键到值的映射；git 不可用时返回空字典。"""
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--global", "--list", "-z"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for item in proc.stdout.split("\0"):
+        if not item:
+            continue
+        key, _, value = item.partition("\n")
+        out[key.lower()] = value
+    return out
+
+
+def set_global_config(key: str, value: str) -> bool:
+    """写入一项全局 git 配置；成功返回 True。"""
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--global", key, value],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 def find_repos(root: Path) -> list[Path]:
@@ -271,3 +315,71 @@ def push_args(remote: str, branch: str, set_upstream: bool) -> list[str]:
         args.append("-u")
     args.extend([remote, branch])
     return args
+
+
+def fetch_args(remote: str) -> list[str]:
+    """抓取参数：顺带清理远端已删除的分支，让落后统计保持准确。"""
+    return ["fetch", "--prune", remote]
+
+
+def pull_args(remote: str, branch: str) -> list[str]:
+    """拉取参数：只允许快进。
+
+    界面里无法处理合并冲突，允许真正的 merge 会把仓库留在冲突态，
+    所以非快进时直接失败并提示，由用户自行决定怎么处理。
+    """
+    return ["pull", "--ff-only", remote, branch]
+
+
+def remote_entries(path: Path) -> list[tuple[str, str]]:
+    """列出远程仓库及其 fetch 地址，顺序与 git 一致。"""
+    ok, out = _git(Path(path), "remote", "-v")
+    if not ok:
+        return []
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] != "(fetch)" or parts[0] in seen:
+            continue
+        seen.add(parts[0])
+        entries.append((parts[0], parts[1]))
+    return entries
+
+
+def current_branch(path: Path) -> str:
+    """当前检出的分支名；detached 时返回空串。"""
+    ok, out = _git(Path(path), "symbolic-ref", "--short", "-q", "HEAD")
+    return out if ok and out else ""
+
+
+def _run_git(path: Path, *args: str, timeout: float = 20) -> tuple[bool, str]:
+    """执行修改型 git 命令：失败时把 stderr 一起返回，用于界面提示。"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except OSError:
+        return False, tr("无法启动 git，请确认已安装并加入 PATH")
+    except subprocess.SubprocessError:
+        return False, tr("git 命令执行超时")
+    text = "\n".join(p for p in (proc.stdout.strip(), proc.stderr.strip()) if p)
+    return proc.returncode == 0, text
+
+
+def remote_add(path: Path, name: str, url: str) -> tuple[bool, str]:
+    return _run_git(Path(path), "remote", "add", name, url)
+
+
+def remote_set_url(path: Path, name: str, url: str) -> tuple[bool, str]:
+    return _run_git(Path(path), "remote", "set-url", name, url)
+
+
+def remote_remove(path: Path, name: str) -> tuple[bool, str]:
+    return _run_git(Path(path), "remote", "remove", name)

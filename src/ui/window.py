@@ -1,21 +1,27 @@
+import os
 import sys
+import threading
 
 from PySide6.QtCore import (
     Qt, QRectF, QRect, Signal, QPointF, QEasingCurve, QVariantAnimation,
-    QAbstractAnimation, QTimer, QEvent,
+    QAbstractAnimation, QTimer, QEvent, QUrl,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPainterPath, QFont, QPen, QPalette, QGuiApplication, QLinearGradient,
-    QCursor, QFontMetrics,
+    QCursor, QFontMetrics, QDesktopServices, QIcon,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
     QGraphicsOpacityEffect, QSpacerItem,
 )
 
-from ..core import store, theme
+from ..core import i18n, store, theme
 from ..core.config import Config
+from ..core.i18n import tr
+from ..core.update import fetch_manifest, is_newer
 from .repo_page import HomePage, RepoPage, SourcesPage, scan_service
+from .repo_detail import RepoDetailPage
+from .update_dialog import UpdateDialog
 
 ZOOM_MS = 240        # 最大化/还原展开收起动画时长
 TITLE_BAR_H = 40       # macOS 顶栏高度（交通灯行）
@@ -528,10 +534,11 @@ class Sidebar(QWidget):
         self._sec_top = QSpacerItem(1, _SIDE_TOP_MAC)
         lay.addItem(self._sec_top)
 
-        section = QLabel("导航")
+        section = QLabel(tr("导航"))
         section.setObjectName("SectionLabel")
         section.setContentsMargins(19, 0, 0, 0)   # 对齐下方导航项图标列
         lay.addWidget(section)
+        self._section_label = section
 
         self._sec_bot = QSpacerItem(1, _SIDE_BOT_MAC)
         lay.addItem(self._sec_bot)
@@ -541,18 +548,27 @@ class Sidebar(QWidget):
                                ("sources", "仓库", "folder"),
                                ("repos", "推送", "upload"),
                                ("settings", "设置", "gear")]:
-            nb = NavButton(key, label, ip)
+            nb = NavButton(key, tr(label), ip)
             nb.clicked_signal.connect(self.navigate_signal)
             self.nav_items.append(nb)
             lay.addWidget(nb)
         lay.addStretch(1)
         # 主栏下方单独一个「关于」入口：与其他导航项隔开、沉底独立
-        self.about_btn = NavButton("about", "关于", "info")
+        self.about_btn = NavButton("about", tr("关于"), "info")
         self.about_btn.clicked_signal.connect(self.navigate_signal)
         self.nav_items.append(self.about_btn)
         lay.addWidget(self.about_btn)
 
         self.nav_items[0].set_active(True)
+
+    def retranslate(self):
+        """热切换语言后刷新侧栏文案。"""
+        self._section_label.setText(tr("导航"))
+        labels = {"home": "首页", "sources": "仓库", "repos": "推送",
+                  "settings": "设置", "about": "关于"}
+        for nb in self.nav_items:
+            nb.label = tr(labels[nb.key])
+            nb.update()
 
     def apply_style(self):
         """按当前风格调整侧栏：Win11 用系统原生标题栏（已自带应用名），
@@ -592,6 +608,11 @@ class ContentArea(QWidget):
         """
         return False, 30, 28, self.width() - 60
 
+    def set_header(self, title: str, subtitle: str):
+        """热切换语言时更新页标题与副标题。"""
+        self.title, self.subtitle = title, subtitle
+        self.update()
+
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -613,10 +634,12 @@ class ContentArea(QWidget):
         # macOS / Win11(原生窗口)：标题带 + 独立圆角占位面板
         p.setFont(title_font)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, self.title)
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(title_font).elidedText(self.title, Qt.ElideRight, int(w)))
         p.setFont(sub_font)
         p.setPen(theme.st("sub_text", dark))
-        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft, self.subtitle)
+        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(sub_font).elidedText(self.subtitle, Qt.ElideRight, int(w)))
 
         panel_r = QRectF(left, top + 72, w, self.height() - (top + 102))
         p.setPen(QPen(theme.st("panel_border", dark), 1))
@@ -627,7 +650,7 @@ class ContentArea(QWidget):
         f.setPointSize(11)
         p.setFont(f)
         p.setPen(theme.st("placeholder", dark))
-        p.drawText(panel_r, Qt.AlignCenter, "内容占位区 — 可在此放入自定义功能模块")
+        p.drawText(panel_r, Qt.AlignCenter, tr("内容占位区 — 可在此放入自定义功能模块"))
         p.end()
 
 
@@ -659,10 +682,25 @@ class SegmentControl(QWidget):
         self._labels.append(label)
         if len(self._keys) == 1:
             self._value = key
+        self._fit_width()
+
+    def set_segments(self, items: list[tuple[str, str]]):
+        """热切换语言时整体替换档位文案，保留当前选中值。"""
+        self._keys = [k for k, _ in items]
+        self._labels = [l for _, l in items]
+        if self._value not in self._keys:
+            self._value = self._keys[0] if self._keys else ""
+        self._pos = float(self._keys.index(self._value)) if self._value in self._keys else 0.0
+        self._fit_width()
+        self.update()
+
+    def _fit_width(self):
         # 等分档位：宽度取最宽文字，各档一致，气泡位置 = 档位序号
+        if not self._labels:
+            return
         fm = QFontMetrics(self._seg_font())
         seg = max(fm.horizontalAdvance(t) for t in self._labels) + 30
-        self.setFixedWidth(seg * len(self._keys))
+        self.setFixedWidth(seg * len(self._labels))
 
     def value(self) -> str:
         return self._value
@@ -811,6 +849,20 @@ class SettingRow(QWidget):
     def add_segment(self, key: str, label: str):
         self.seg.add_segment(key, label)
 
+    def set_title(self, title: str):
+        """热切换语言时更新行标题。"""
+        self.title = title
+        self.update()
+
+    def set_segments(self, items: list[tuple[str, str]]):
+        """热切换语言时替换右侧档位文案。"""
+        self.seg.set_segments(items)
+        self._value_text = ""
+        self.seg.setVisible(True)
+        self.seg.move(self.width() - self.seg.width() - 16,
+                      (self.height() - self.seg.height()) // 2)
+        self.update()
+
     def set_value_text(self, text: str):
         self._value_text = text
         self.seg.setVisible(not text)
@@ -846,10 +898,16 @@ class SettingRow(QWidget):
         tf.setBold(True)
         p.setFont(tf)
         p.setPen(theme.st("title_text", dark))
+        # 为右侧胶囊留出空间，英文长标题按可用宽度省略
+        limit = self.width() - 32
+        if self.seg.isVisible() and self.seg.x() > 0:
+            limit = min(limit, self.seg.x() - 32)
+        limit = max(80, limit)
+        title = QFontMetrics(tf).elidedText(self.title, Qt.ElideRight, int(limit))
         if self._hint:
             # 有行内提示时标题上移，提示写在下方，右侧胶囊不受影响
-            p.drawText(QRectF(16, 8, self.width() - 32, 26),
-                       Qt.AlignLeft | Qt.AlignVCenter, self.title)
+            p.drawText(QRectF(16, 8, limit, 26),
+                       Qt.AlignLeft | Qt.AlignVCenter, title)
             hf = QFont(self.font())
             hf.setPointSize(9)
             p.setFont(hf)
@@ -861,7 +919,7 @@ class SettingRow(QWidget):
                        Qt.AlignLeft | Qt.AlignVCenter, txt)
         else:
             p.drawText(QRectF(16, cy - 16, self.width() - 32, 32),
-                       Qt.AlignLeft | Qt.AlignVCenter, self.title)
+                       Qt.AlignLeft | Qt.AlignVCenter, title)
             if self._value_text:
                 p.setFont(self.seg._seg_font())
                 p.setPen(theme.st("sub_text", dark))
@@ -870,16 +928,325 @@ class SettingRow(QWidget):
         p.end()
 
 
+def _app_icon_path() -> str:
+    """icon.ico 路径：源码运行取项目根目录，打包后取可执行文件目录。"""
+    bases = (os.path.dirname(os.path.abspath(sys.argv[0] or __file__)),
+             os.path.dirname(os.path.dirname(os.path.dirname(
+                 os.path.abspath(__file__)))))
+    for base in bases:
+        path = os.path.join(base, "icon.ico")
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
 class AboutPage(ContentArea):
-    """关于页：内容已清空，保留页面占位。"""
+    """关于页：展示应用信息、运行环境与本地配置位置。"""
+
+    _PAD = 32
+    update_checked = Signal(object, object)  # (UpdateInfo, 异常)
 
     def __init__(self, parent=None):
-        super().__init__("", "")
+        super().__init__(tr("关于"), tr("应用信息与运行环境"))
+        self.setMouseTracking(True)
+        self._hits = []            # (键, 命中矩形)：绘制顺序即覆盖顺序
+        self._hover = ""
+        self._toast = ""
+        self._pix = None
+        self._checking = False
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._clear_toast)
+        self.update_checked.connect(self._on_update_checked)
+
+    def _hit_at(self, pos) -> str:
+        for key, rect in self._hits:
+            if rect.contains(QPointF(pos)):
+                return key
+        return ""
+
+    def retranslate(self):
+        """热切换语言后刷新页标题（正文在绘制时实时翻译）。"""
+        self.set_header(tr("关于"), tr("应用信息与运行环境"))
+
+    def mouseMoveEvent(self, e):
+        key = self._hit_at(e.position())
+        if key != self._hover:
+            self._hover = key
+            self.setCursor(Qt.PointingHandCursor if key else Qt.ArrowCursor)
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        if self._hover:
+            self._hover = ""
+            self.update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        key = self._hit_at(e.position())
+        if key:
+            self._activate(key)
+        super().mouseReleaseEvent(e)
+
+    def _activate(self, key: str):
+        if key == "check":
+            self._start_update_check()
+        elif key == "mail":
+            QDesktopServices.openUrl(QUrl(f"mailto:{Config.APP_EMAIL}"))
+        elif key == "open_dir":
+            folder = str(store.config_path().parent)
+            if os.path.isdir(folder):
+                os.startfile(folder)
+            else:
+                self._show_toast(tr("配置文件目录尚不存在"))
+        elif key == "copy":
+            QGuiApplication.clipboard().setText(
+                f"{Config.APP_NAME} {Config.APP_VERSION}\n"
+                f"{Config.APP_AUTHOR} <{Config.APP_EMAIL}>")
+            self._show_toast(tr("已复制版本信息"))
+
+    def _start_update_check(self):
+        if self._checking:
+            return
+        self._checking = True
+        self.update()
+        threading.Thread(target=self._check_worker, daemon=True,
+                         name="gitool-update-check").start()
+
+    def _check_worker(self):
+        try:
+            info = fetch_manifest()
+        except Exception as e:
+            self.update_checked.emit(None, e)
+            return
+        self.update_checked.emit(info, None)
+
+    def _on_update_checked(self, info, error):
+        self._checking = False
+        self.update()
+        if error is not None:
+            self._show_toast(tr("检查更新失败：{err}", err=error), 4000)
+            return
+        if not is_newer(info.version, Config.APP_VERSION):
+            self._show_toast(tr("已是最新版本（{version}）",
+                                version=Config.APP_VERSION))
+            return
+        UpdateDialog(info, self.window()).exec()
+
+    def _show_toast(self, text: str, msec: int = 1800):
+        self._toast = text
+        self._toast_timer.start(msec)
+        self.update()
+
+    def _clear_toast(self):
+        self._toast = ""
+        self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.fillRect(self.rect(), theme.st("content_bg", is_dark(self)))
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        dark = is_dark(self)
+        self._hits = []
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.st("content_bg", dark))
+        p.drawRect(self.rect())
+
+        _, left, top, w = self.header_geometry()
+        title_font = QFont(self.font())
+        title_font.setPointSize(18)
+        title_font.setBold(True)
+        p.setFont(title_font)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, self.title)
+        sub_font = QFont(self.font())
+        sub_font.setPointSize(10)
+        p.setFont(sub_font)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft, self.subtitle)
+
+        radius = theme.st("panel_radius", dark)
+        panel = QRectF(left, top + 72, w, self.height() - (top + 102))
+        p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.setBrush(theme.st("panel_bg", dark))
+        p.drawRoundedRect(panel, radius, radius)
+
+        pad = self._PAD
+        x = panel.left() + pad
+        outer_w = panel.width() - 2 * pad
+        y = panel.top() + pad
+
+        # 图标 + 名称/版本
+        icon_r = QRectF(x, y, 64, 64)
+        self._draw_icon(p, icon_r, dark)
+        tx = icon_r.right() + 20
+        name_font = QFont(self.font())
+        name_font.setPointSize(19)
+        name_font.setBold(True)
+        p.setFont(name_font)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(tx, y + 4, panel.right() - pad - tx, 32),
+                   Qt.AlignLeft | Qt.AlignVCenter, Config.APP_NAME)
+        info_font = QFont(self.font())
+        info_font.setPointSize(10)
+        p.setFont(info_font)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(tx, y + 38, panel.right() - pad - tx, 22),
+                   Qt.AlignLeft | Qt.AlignVCenter,
+                   tr("版本 {version}", version=Config.APP_VERSION))
+
+        # 描述
+        dy = icon_r.bottom() + 22
+        p.setFont(info_font)
+        fm_info = QFontMetrics(info_font)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(x, dy, outer_w, 22), Qt.AlignLeft | Qt.AlignVCenter,
+                   fm_info.elidedText(
+                       tr("把分散在各处的 Git 仓库集中到一处：统一查看改动、管理远程、批量推送。"),
+                       Qt.ElideRight, int(outer_w)))
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(x, dy + 22, outer_w, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                   fm_info.elidedText(
+                       tr("所有 git 命令都在本机执行，不收集使用数据，也不会主动联网。"),
+                       Qt.ElideRight, int(outer_w)))
+
+        # 分隔线
+        sep_y = dy + 22 + 20 + 18
+        p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.drawLine(QPointF(x, sep_y), QPointF(panel.right() - pad, sep_y))
+
+        # 信息两列
+        col_w = outer_w / 2
+        rows = [
+            ((tr("作者"), Config.APP_AUTHOR, ""),
+             (tr("开源协议"), "GNU GPL-3.0", "")),
+            ((tr("邮箱"), Config.APP_EMAIL, "mail"),
+             (tr("运行环境"), tr("Windows 10 / 11 · 64 位"), "")),
+        ]
+        fy = sep_y + 16
+        for row in rows:
+            self._draw_field(p, x, fy, col_w, *row[0], dark)
+            self._draw_field(p, x + col_w, fy, col_w, *row[1], dark)
+            fy += 30
+        self._draw_field(p, x, fy, outer_w, tr("配置文件"), str(store.config_path()),
+                         "open_dir", dark)
+
+        # 按钮贴近底部提示，避免大窗口下与信息区之间留出突兀空白；
+        # 英文文案更宽，一行放不下时自动折成两行
+        fm = QFontMetrics(info_font)
+        items = [("check", tr("检查更新中…") if self._checking else tr("检查更新")),
+                 ("mail", tr("发送反馈")), ("open_dir", tr("打开配置目录")),
+                 ("copy", tr("复制版本信息"))]
+        widths = [fm.horizontalAdvance(t) + 34 for _, t in items]
+        if sum(widths) + 10 * (len(items) - 1) <= outer_w:
+            groups = [list(zip(items, widths))]
+        else:
+            groups = [list(zip(items[:2], widths[:2])),
+                      list(zip(items[2:], widths[2:]))]
+        btn_y = panel.bottom() - 40 - 20 - 12 - 42 * len(groups)
+        for group in groups:
+            bx = x
+            for (key, text), bw in group:
+                self._draw_button(p, QRectF(bx, btn_y, bw, 32), text, key, dark,
+                                  primary=(key == "check"))
+                bx += bw + 10
+            btn_y += 42
+
+        # 底部说明或临时提示
+        hint_font = QFont(self.font())
+        hint_font.setPointSize(9)
+        p.setFont(hint_font)
+        if self._toast:
+            p.setPen(theme.st("accent", dark))
+            hint = self._toast
+        else:
+            p.setPen(theme.st("placeholder", dark))
+            hint = tr("点击邮箱可发送反馈，点击配置文件路径可打开所在目录")
+        hint = QFontMetrics(hint_font).elidedText(hint, Qt.ElideRight, int(outer_w))
+        p.drawText(QRectF(x, panel.bottom() - 40, outer_w, 20),
+                   Qt.AlignLeft | Qt.AlignVCenter, hint)
         p.end()
+
+    def _draw_icon(self, p: QPainter, r: QRectF, dark: bool):
+        pm = self._icon_pixmap()
+        if pm is not None and not pm.isNull():
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
+            return
+        # 取不到图标时用主题色方块 + 首字母兜底
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.st("accent", dark))
+        p.drawRoundedRect(r, 14, 14)
+        f = QFont(self.font())
+        f.setPointSize(26)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(r, Qt.AlignCenter, Config.APP_NAME[:1])
+
+    def _icon_pixmap(self):
+        if self._pix is None:
+            path = _app_icon_path()
+            if path:
+                self._pix = QIcon(path).pixmap(144, 144)
+        return self._pix
+
+    def _draw_field(self, p: QPainter, x: float, y: float, w: float,
+                    label: str, value: str, key: str, dark: bool):
+        """画一行「标签 + 值」；key 非空时该值为可点击链接。"""
+        font = QFont(self.font())
+        font.setPointSize(10)
+        p.setFont(font)
+        p.setPen(theme.st("sub_text", dark))
+        p.drawText(QRectF(x, y, 72, 24), Qt.AlignLeft | Qt.AlignVCenter, label)
+
+        value_font = QFont(font)
+        value_font.setBold(bool(key))
+        p.setFont(value_font)
+        fm = QFontMetrics(value_font)
+        vw = max(40.0, w - 72)
+        text = fm.elidedText(value, Qt.ElideRight, int(vw))
+        accent = theme.st("accent", dark)
+        hover = bool(key) and self._hover == key
+        if key:
+            p.setPen(QColor(accent).lighter(118) if hover else accent)
+        else:
+            p.setPen(theme.st("title_text", dark))
+        vr = QRectF(x + 72, y, vw, 24)
+        p.drawText(vr, Qt.AlignLeft | Qt.AlignVCenter, text)
+        if key:
+            tw = min(vw, fm.horizontalAdvance(text) + 4)
+            self._hits.append((key, QRectF(vr.left(), vr.top(), tw, vr.height())))
+            if hover:
+                p.setPen(QPen(p.pen().color(), 1))
+                p.drawLine(QPointF(vr.left(), vr.top() + 20),
+                           QPointF(vr.left() + tw - 4, vr.top() + 20))
+
+    def _draw_button(self, p: QPainter, r: QRectF, text: str, key: str, dark: bool,
+                     primary: bool = False):
+        accent = theme.st("accent", dark)
+        hover = self._hover == key
+        if primary:
+            p.setBrush(accent.lighter(112) if hover else accent)
+            p.setPen(Qt.NoPen)
+        elif hover:
+            p.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 36))
+            p.setPen(QPen(accent, 1))
+        else:
+            p.setBrush(QColor(255, 255, 255, 150) if not dark
+                       else QColor(255, 255, 255, 16))
+            p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.drawRoundedRect(r, 8, 8)
+        f = QFont(self.font())
+        f.setPointSize(10)
+        p.setFont(f)
+        if primary:
+            p.setPen(QColor("#ffffff"))
+        else:
+            p.setPen(QColor(accent).lighter(115) if hover else theme.st("title_text", dark))
+        p.drawText(r, Qt.AlignCenter, text)
+        self._hits.append((key, r))
 
 
 class CategoryList(QWidget):
@@ -947,7 +1314,8 @@ class CategoryList(QWidget):
                 p.setPen(theme.st("title_text", dark))
             else:
                 p.setPen(theme.st("sub_text", dark))
-            p.drawText(r, Qt.AlignCenter, t)
+            text = QFontMetrics(f).elidedText(t, Qt.ElideRight, int(r.width()) - 10)
+            p.drawText(r, Qt.AlignCenter, text)
         p.end()
 
     def mousePressEvent(self, e):
@@ -999,7 +1367,7 @@ class SettingsPage(ContentArea):
     MENU_W = 96                           # 左侧分类菜单宽度
 
     def __init__(self, parent=None):
-        super().__init__("设置", "个性化外观与行为")
+        super().__init__(tr("设置"), tr("个性化外观与行为"))
         # [cid, title, sections]；sections=[sid, 标题, [(key,label)], 行控件]
         self.categories = []
         self._active = 0
@@ -1024,7 +1392,7 @@ class SettingsPage(ContentArea):
     def add_section(self, cid: str, section_id: str, title: str):
         for cat in self.categories:
             if cat[0] == cid:
-                row = SettingRow(title, self._right)
+                row = SettingRow(tr(title), self._right)
                 row.valueChanged.connect(
                     lambda k, sid=section_id: self.option_picked.emit(sid, k))
                 cat[2].append([section_id, title, [], row])
@@ -1037,14 +1405,20 @@ class SettingsPage(ContentArea):
             for sec in cat[2]:
                 if sec[0] == section_id:
                     sec[2].append((key, label))
-                    sec[3].add_segment(key, label)
+                    sec[3].add_segment(key, tr(label))
                     return
 
     def _register_builtin(self):
         # 「常规」注册在「个性化」之前，故侧菜单排在前面
         self.add_category("general", "常规")
         self.add_section("general", "about", "通用")
-        self.add_option("general", "about", "version", f"应用 · {Config.APP_NAME}")
+        self.add_option("general", "about", "version", "应用 · {name}")
+        self.add_section("general", "language", "显示语言")
+        # 「跟随系统」放在最左：默认档位对应滑块起始位置
+        for key, label in ((i18n.LANG_SYSTEM, "跟随系统"),
+                           (i18n.LANG_ZH, "简体中文"),
+                           (i18n.LANG_EN, "English")):
+            self.add_option("general", "language", key, label)
 
         self.add_category("personal", "个性化")
         self.add_section("personal", "style", "界面风格")
@@ -1055,12 +1429,23 @@ class SettingsPage(ContentArea):
             self.add_option("personal", "theme", key, theme.THEME_LABEL[key])
 
         self.add_category("security", "安全")
-        self.add_section("security", "sensitive", "敏感操作二次校验")
+        self.add_section("security", "sensitive", "敏感操作二次校验（Beta）")
         self.add_option("security", "sensitive", "off", "关闭")
         self.add_option("security", "sensitive", "on", "开启")
 
     def _refresh_menu(self):
-        self._menu.set_items([c[1] for c in self.categories])
+        self._menu.set_items([tr(c[1]) for c in self.categories])
+
+    def retranslate(self):
+        """热切换语言后重建设置页文案并重新布局。"""
+        self.set_header(tr("设置"), tr("个性化外观与行为"))
+        self._refresh_menu()
+        for cat in self.categories:
+            for sid, title, items, row in cat[2]:
+                row.set_title(tr(title))
+                if len(items) > 1:
+                    row.set_segments([(k, tr(label)) for k, label in items])
+        self._layout_right()
 
     def _preselect(self):
         for cat in self.categories:
@@ -1072,6 +1457,8 @@ class SettingsPage(ContentArea):
                 elif sid == "sensitive":
                     self.select(sid, "on" if store.sensitive_verify_required() else "off",
                                 animate=False)
+                elif sid == "language":
+                    self.select(sid, i18n.mode(), animate=False)
         # 初始选中首个包含分组内容的分类
         self._active = next((i for i, c in enumerate(self.categories) if c[2]), 0)
         self._menu.set_active(self._active)
@@ -1104,7 +1491,14 @@ class SettingsPage(ContentArea):
                 row.setVisible(False)
                 continue
             # 单选项的分组（如版本信息）不显示胶囊，右侧直接显示取值
-            row.set_value_text(items[0][1] if len(items) == 1 else "")
+            if len(items) == 1:
+                key, label = items[0]
+                if key == "version":
+                    row.set_value_text(tr("应用 · {name}", name=Config.APP_NAME))
+                else:
+                    row.set_value_text(tr(label))
+            else:
+                row.set_value_text("")
             row._base = (0, y, self._content_w, self.CARD_H)
             y += self.CARD_H + gap
         self._content_h = max(0, y - gap)
@@ -1208,10 +1602,12 @@ class SettingsPage(ContentArea):
         _, left, top, w = self.header_geometry()
         p.setFont(title_font)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, self.title)
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(title_font).elidedText(self.title, Qt.ElideRight, int(w)))
         p.setFont(sub_font)
         p.setPen(theme.st("sub_text", dark))
-        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft, self.subtitle)
+        p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
+                   QFontMetrics(sub_font).elidedText(self.subtitle, Qt.ElideRight, int(w)))
         p.end()
 
     def resizeEvent(self, e):
@@ -1265,6 +1661,7 @@ class AppWindow(QWidget):
         self.repo_page = None
         self.sources_page = None
         self.home_page = None
+        self.about_page = None
         self._sensitive_busy = False   # 关闭二次校验的验证进行中，防止重复触发
         for item in self.sidebar.nav_items:
             if item.key == "settings":
@@ -1273,6 +1670,7 @@ class AppWindow(QWidget):
                 p.option_picked.connect(self._on_settings_option)
             elif item.key == "about":
                 p = AboutPage()
+                self.about_page = p
             elif item.key == "home":
                 p = HomePage()
                 self.home_page = p
@@ -1283,8 +1681,15 @@ class AppWindow(QWidget):
                 p = RepoPage()
                 self.repo_page = p
             else:
-                p = ContentArea(item.label, "自定义功能待填充")
+                p = ContentArea(item.label, tr("自定义功能待填充"))
             self.add_page(item.key, p)
+
+        # 仓库详情：不在侧栏出现，由「仓库」页的条目点开，返回时回到仓库页
+        self.repo_detail = RepoDetailPage()
+        self.add_page("repo_detail", self.repo_detail)
+        self.repo_detail.back_requested.connect(lambda: self._switch_page("sources"))
+        if self.sources_page is not None:
+            self.sources_page.open_repo_requested.connect(self._open_repo_detail)
 
         # 内容区顶部透明拖拽条（仅 macOS 自绘顶栏使用）
         self._topdrag = TopDragBar(self)
@@ -1366,6 +1771,16 @@ class AppWindow(QWidget):
     def _switch_page(self, key: str):
         for item in self.sidebar.nav_items:
             item.set_active(item.key == key)
+        self._show_page(key)
+
+    def _open_repo_detail(self, target):
+        """从仓库页进入详情：侧栏高亮仍留在「仓库」。"""
+        self.repo_detail.open_repo(target)
+        for item in self.sidebar.nav_items:
+            item.set_active(item.key == "sources")
+        self._show_page("repo_detail")
+
+    def _show_page(self, key: str):
         if key not in self.pages or self.stack.currentWidget() is self.pages[key]:
             return
         # 防抖：上一轮过渡仍在播放时（并非因中途停止而残留透明效果/位移），
@@ -1453,6 +1868,8 @@ class AppWindow(QWidget):
             self.repo_page.apply_style()
         if self.sources_page is not None:
             self.sources_page.apply_style()
+        if self.repo_detail is not None:
+            self.repo_detail.apply_style()
         for b in self.sidebar.header.findChildren(TrafficLightButton):
             b.update()
         self.settings_page.select("style", key)
@@ -1473,6 +1890,30 @@ class AppWindow(QWidget):
                 self.settings_page.select("sensitive", "on")
             else:
                 self._disable_sensitive_guard()
+        elif sid == "language":
+            self.set_language(key)
+
+    def set_language(self, key: str):
+        """切换界面语言并立即刷新全部页面文案。"""
+        i18n.set_language(key)
+        self._retranslate()
+
+    def _retranslate(self):
+        self.sidebar.retranslate()
+        self.settings_page.retranslate()
+        self.settings_page.select("language", i18n.mode())
+        if self.about_page is not None:
+            self.about_page.retranslate()
+        if self.home_page is not None:
+            self.home_page.update()
+        if self.repo_page is not None:
+            self.repo_page.retranslate()
+        if self.sources_page is not None:
+            self.sources_page.retranslate()
+        if self.repo_detail is not None:
+            self.repo_detail.retranslate()
+        self.stack.update()
+        self.update()
 
     def _disable_sensitive_guard(self):
         """关闭敏感操作二次校验本身需要验证身份；不通过则保持开启。
@@ -1485,12 +1926,12 @@ class AppWindow(QWidget):
             self._sensitive_busy = False
             if not result.ok:
                 self.settings_page.show_hint(
-                    "sensitive", f"{result.message}，保护保持开启")
+                    "sensitive", tr("{msg}，保护保持开启", msg=result.message))
                 return
             store.set_value("sensitive_verify", False)
             self.settings_page.select("sensitive", "off")
 
-        self.repo_page.confirm("GiTool：关闭敏感操作二次校验需要验证身份", done)
+        self.repo_page.confirm(tr("GiTool：关闭敏感操作二次校验需要验证身份"), done)
 
     def set_theme(self, key: str):
         if not theme.set_theme(key):
@@ -1503,6 +1944,8 @@ class AppWindow(QWidget):
             self.repo_page.apply_style()
         if self.sources_page is not None:
             self.sources_page.apply_style()
+        if self.repo_detail is not None:
+            self.repo_detail.apply_style()
         for b in self.sidebar.header.findChildren(TrafficLightButton):
             b.update()
         self.settings_page.select("theme", key)
@@ -1515,6 +1958,12 @@ class AppWindow(QWidget):
             self.sidebar.header.set_window_active(True)
         elif e.type() == QEvent.WindowStateChange:
             self._sync_light_poll()
+        elif (e.type() == QEvent.LocaleChange
+              and i18n.mode() == i18n.LANG_SYSTEM
+              and i18n.resolve(i18n.LANG_SYSTEM) != i18n.language()):
+            # 跟随系统模式下，系统语言变化时立即热切换
+            i18n.set_language(i18n.LANG_SYSTEM)
+            self._retranslate()
         super().changeEvent(e)
 
     def _sync_light_poll(self):
@@ -1611,6 +2060,7 @@ class AppWindow(QWidget):
         # 关闭前收敛后台扫描/验证线程，避免 QThread 在运行中被销毁
         if self.repo_page is not None:
             self.repo_page.shutdown()
+        self.repo_detail.shutdown()
         scan_service().shutdown()
         super().closeEvent(e)
 

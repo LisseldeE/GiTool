@@ -19,12 +19,13 @@ from PySide6.QtGui import (
     QPainterPath, QPalette, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox,
-    QScrollArea, QScrollBar, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QScrollArea, QScrollBar, QVBoxLayout, QWidget,
 )
 
 from ..core import gitrepo, store, theme, verify
 from ..core.gitrepo import RemoteBranch, RepoInfo
+from ..core.i18n import tr
 
 # 仓库无 icon.ico 时，用名称首字母生成头像底色
 _AVATAR_COLORS = (
@@ -36,6 +37,13 @@ _RED = QColor("#e5534b")
 _ORANGE = QColor("#d99036")
 
 _TITLE_PT, _SUB_PT, _BODY_PT = 18, 10, 9
+
+# 首页「用户配置」可点击修改的全局 git 配置项
+_USER_FIELDS = (
+    ("用户名", "user.name"),
+    ("邮箱", "user.email"),
+)
+_USER_ROW_H = 46
 
 _PANEL_TOP = 102
 _BAR_H = 46
@@ -113,14 +121,14 @@ def _elide(painter: QPainter, text: str, width: float) -> str:
 def _gap_text(rb: RemoteBranch) -> tuple[str, QColor]:
     """远程差距文案与颜色。"""
     if not rb.exists:
-        return "未推送", _ORANGE
+        return tr("未推送"), _ORANGE
     if rb.ahead and rb.behind:
         return f"↑{rb.ahead} ↓{rb.behind}", _GREEN
     if rb.ahead:
         return f"↑{rb.ahead}", _GREEN
     if rb.behind:
         return f"↓{rb.behind}", _ORANGE
-    return "已同步", QColor()
+    return tr("已同步"), QColor()
 
 
 def _norm(path: str) -> str:
@@ -275,6 +283,15 @@ class PillButton(QWidget):
         self._accept = True
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(108, 32)
+
+    def set_text(self, text: str):
+        """热切换语言时更新按钮文字，并按文字宽度调整按钮尺寸。"""
+        self.text = text
+        f = QFont(self.font())
+        f.setPointSize(9)
+        w = max(108, QFontMetrics(f).horizontalAdvance(text) + 36)
+        self.setFixedSize(w, 32)
+        self.update()
 
     def set_accept(self, accept: bool):
         self._accept = accept
@@ -760,7 +777,7 @@ class RepoRow(QWidget):
             p.setFont(f_sub)
             p.setPen(theme.st("placeholder", dark))
             p.drawText(QRectF(16, y, w - 32, 19), Qt.AlignVCenter | Qt.AlignLeft,
-                       "未配置远程仓库")
+                       tr("未配置远程仓库"))
         for rb in self.repo.remotes:
             self._paint_remote_line(p, rb, y, w, dark)
             y += 19
@@ -794,7 +811,8 @@ class RepoRow(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(theme.st("nav_text", dark))
-        label = f"{rb.remote}/{rb.branch}" if rb.exists else f"{rb.remote} · 新分支"
+        label = f"{rb.remote}/{rb.branch}" if rb.exists else tr(
+            "{remote} · 新分支", remote=rb.remote)
         p.drawText(QRectF(16, y, 132, 19), Qt.AlignVCenter | Qt.AlignLeft,
                    _elide(p, label, 132))
 
@@ -805,11 +823,12 @@ class RepoRow(QWidget):
 
         text, color = _gap_text(rb)
         p.setPen(color if color.isValid() else theme.st("placeholder", dark))
-        p.drawText(QRectF(214, y, 56, 19), Qt.AlignVCenter | Qt.AlignLeft, text)
+        p.drawText(QRectF(214, y, 72, 19), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, text, 72))
 
         p.setPen(theme.st("placeholder", dark))
-        subject_w = max(0, w - 276 - 60)
-        p.drawText(QRectF(276, y, subject_w, 19), Qt.AlignVCenter | Qt.AlignLeft,
+        subject_w = max(0, w - 292 - 60)
+        p.drawText(QRectF(292, y, subject_w, 19), Qt.AlignVCenter | Qt.AlignLeft,
                    _elide(p, rb.subject or "—", subject_w))
 
 
@@ -836,16 +855,22 @@ def _chip_font(base: QFont) -> QFont:
 class EmptyState(QWidget):
     """列表为空/扫描中的居中提示。"""
 
-    def __init__(self, parent=None, btn_text: str = "选择目录"):
+    def __init__(self, parent=None, btn_text: str | None = None):
         super().__init__(parent)
-        self.title = "还没有仓库"
-        self.subtitle = "选择一个目录，扫描其中所有 Git 仓库"
+        self.title = tr("还没有仓库")
+        self.subtitle = tr("选择一个目录，扫描其中所有 Git 仓库")
         self.scanning = False
-        self.btn = PillButton(btn_text, self)
+        self.btn = PillButton(btn_text or tr("选择目录"), self)
 
     def set_text(self, title: str, subtitle: str):
         self.title, self.subtitle = title, subtitle
         self.update()
+
+    def set_button_text(self, text: str):
+        """热切换语言时更新按钮文案并重新居中。"""
+        self.btn.set_text(text)
+        self.btn.move((self.width() - self.btn.width()) // 2,
+                      self.height() // 2 + 52)
 
     def set_scanning(self, scanning: bool):
         self.scanning = scanning
@@ -960,7 +985,7 @@ class StatusBar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.text = "选择操作以继续"
+        self.text = tr("选择操作以继续")
         self.kind = "idle"
         self.setFixedHeight(38)
         self._phase = 0.0
@@ -1159,7 +1184,8 @@ class DetailPanel(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 8, 0, 8)
         lv.setSpacing(4)
-        lv.addWidget(self._label("推送到", 8, "sub_text"))
+        self.remote_label = self._label(tr("推送到"), 8, "sub_text")
+        lv.addWidget(self.remote_label)
         n = len(self.remotes)
         if n:
             content = self.height() - 16
@@ -1172,7 +1198,8 @@ class DetailPanel(QWidget):
                 self._options.append(opt)
                 lv.addWidget(opt)
         else:
-            lv.addWidget(self._label("没有需要推送的远程", 8, "placeholder"))
+            self.no_remote_label = self._label(tr("没有需要推送的远程"), 8, "placeholder")
+            lv.addWidget(self.no_remote_label)
         lv.addStretch(1)
         root.addWidget(left)
 
@@ -1203,10 +1230,21 @@ class DetailPanel(QWidget):
     def _refresh_summary(self):
         rb = self.remote
         count = rb.ahead if rb else 0
-        self.headline.setText(f"即将推送 {count} 个提交")
-        self.branch_lab.setText(f"当前分支：{self.repo.branch}")
+        self.headline.setText(tr("即将推送 {n} 个提交", n=count))
+        self.branch_lab.setText(tr("当前分支：{branch}", branch=self.repo.branch))
         has = rb is not None and not self.repo.detached
         self.pad.set_enabled(has and not self.busy, not self.busy)
+
+    def retranslate(self):
+        """热切换语言后刷新静态文案与摘要。"""
+        self.remote_label.setText(tr("推送到"))
+        if self.remotes:
+            pass
+        else:
+            self.no_remote_label.setText(tr("没有需要推送的远程"))
+        self._refresh_summary()
+        if not self.busy:
+            self.status.set_state(tr("选择操作以继续"), "idle")
 
     # ---------- 交互 ----------
     def _select_remote(self, rb: RemoteBranch):
@@ -1288,7 +1326,7 @@ class RepoPage(QWidget):
                 self._sources = [{"path": legacy, "kind": "folder"}]
                 store.save_repo_sources(self._sources)
 
-        self.refresh_btn = PillButton("刷新", self)
+        self.refresh_btn = PillButton(tr("刷新"), self)
         self.refresh_btn.clicked.connect(self._refresh)
         self.refresh_btn.set_accept(bool(self._sources))
 
@@ -1321,11 +1359,16 @@ class RepoPage(QWidget):
         return QRect(30, _PANEL_TOP, max(0, self.width() - 60),
                      max(0, self.height() - _PANEL_TOP - 28))
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
+    def _place_buttons(self):
+        """按当前按钮宽度靠右排列（语言切换后按钮宽度会变化）。"""
         panel = self._panel_rect()
         self.refresh_btn.move(panel.right() - self.refresh_btn.width() - 14,
                               panel.top() + 7)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_buttons()
+        panel = self._panel_rect()
         body = QRect(panel.left() + 1, panel.top() + _BAR_H,
                      panel.width() - 2, panel.height() - _BAR_H - 1)
         self.scroll.setGeometry(body)
@@ -1345,14 +1388,15 @@ class RepoPage(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "推送")
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, tr("推送"), w))
 
         f.setPointSize(_SUB_PT)
         f.setBold(False)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
-                   "汇总「仓库」页登记的所有来源，推送前需要系统身份验证")
+                   _elide(p, tr("汇总「仓库」页登记的所有来源，推送前需要系统身份验证"), w))
 
         panel = self._panel_rect()
         r = theme.st("panel_radius", dark)
@@ -1362,11 +1406,12 @@ class RepoPage(QWidget):
 
         # 面板顶栏：来源数量与仓库总数 / 扫描状态
         if self._is_scanning():
-            root_text = "正在扫描目录…"
+            root_text = tr("正在扫描目录…")
         elif self._sources:
-            root_text = f"{len(self._sources)} 个来源 · {len(self._repos)} 个仓库"
+            root_text = tr("{sources} 个来源 · {repos} 个仓库",
+                           sources=len(self._sources), repos=len(self._repos))
         else:
-            root_text = "尚未添加仓库目录"
+            root_text = tr("尚未添加仓库目录")
         f = QFont(self.font())
         f.setPointSize(8)
         p.setFont(f)
@@ -1433,7 +1478,7 @@ class RepoPage(QWidget):
             self._show_scanning()
 
     def _show_scanning(self):
-        self.empty.set_text("正在扫描目录…", "正在查找其中的 Git 仓库")
+        self.empty.set_text(tr("正在扫描目录…"), tr("正在查找其中的 Git 仓库"))
         self.empty.set_scanning(True)
         self.empty.show()
         self.scroll.hide()
@@ -1459,11 +1504,31 @@ class RepoPage(QWidget):
         else:
             self.empty.set_scanning(False)
             if self._sources:
-                self.empty.set_text("没有找到 Git 仓库", "换一个目录试试，其中不含含 .git 的文件夹")
+                self.empty.set_text(tr("没有找到 Git 仓库"),
+                                    tr("换一个目录试试，其中不含含 .git 的文件夹"))
             else:
-                self.empty.set_text("还没有添加仓库目录", "到「仓库」页添加仓库或文件夹后再回来")
+                self.empty.set_text(tr("还没有添加仓库目录"),
+                                    tr("到「仓库」页添加仓库或文件夹后再回来"))
             self.empty.show()
             self.scroll.hide()
+        self.update()
+
+    def retranslate(self):
+        """热切换语言后刷新按钮、空状态与已打开的详情面板。"""
+        self.refresh_btn.set_text(tr("刷新"))
+        self._place_buttons()
+        self.empty.set_button_text(tr("选择目录"))
+        if self.empty.isVisible():
+            if self._is_scanning():
+                self.empty.set_text(tr("正在扫描目录…"), tr("正在查找其中的 Git 仓库"))
+            elif self._sources:
+                self.empty.set_text(tr("没有找到 Git 仓库"),
+                                    tr("换一个目录试试，其中不含含 .git 的文件夹"))
+            elif not self._repos:
+                self.empty.set_text(tr("还没有添加仓库目录"),
+                                    tr("到「仓库」页添加仓库或文件夹后再回来"))
+        if self._detail is not None:
+            self._detail.retranslate()
         self.update()
 
     def _empty_tick(self):
@@ -1764,11 +1829,11 @@ class RepoPage(QWidget):
         self._set_rows_locked(True)
         if not store.sensitive_verify_required():
             # 「安全」里关闭了敏感操作二次校验：直接推送
-            detail.set_status(f"正在推送到 {remote.remote}…", "busy")
+            detail.set_status(tr("正在推送到 {remote}…", remote=remote.remote), "busy")
             self._start_push(remote)
             return
-        detail.set_status("正在等待系统身份验证…", "busy")
-        self._verify("GiTool：请验证身份以继续推送",
+        detail.set_status(tr("正在等待系统身份验证…"), "busy")
+        self._verify(tr("GiTool：请验证身份以继续推送"),
                      lambda result: self._after_verify(remote, result))
 
     def confirm(self, message: str, callback) -> None:
@@ -1820,7 +1885,8 @@ class RepoPage(QWidget):
                 return
             result = session.finish()
         except Exception as exc:
-            result = verify.VerifyResult(False, "error", f"验证调用失败：{exc}")
+            result = verify.VerifyResult(False, "error",
+                                         tr("验证调用失败：{err}", err=exc))
         self._verify_session = None
         self._stop_verify_timer()
         self._restore_focus()
@@ -1872,9 +1938,10 @@ class RepoPage(QWidget):
         if not result.ok:
             detail.set_busy(False)
             self._set_rows_locked(False)
-            detail.set_status(f"{result.message}，可重新验证或取消", "error")
+            detail.set_status(tr("{msg}，可重新验证或取消", msg=result.message), "error")
             return
-        detail.set_status(f"验证通过，正在推送到 {remote.remote}…", "busy")
+        detail.set_status(tr("验证通过，正在推送到 {remote}…", remote=remote.remote),
+                          "busy")
         self._start_push(remote)
 
     def _start_push(self, remote: RemoteBranch):
@@ -1893,7 +1960,7 @@ class RepoPage(QWidget):
         if self._detail is not None and self._detail.busy:
             self._detail.set_busy(False)
             self._set_rows_locked(False)
-            self._detail.set_status("无法启动 git，请确认已安装并加入 PATH", "error")
+            self._detail.set_status(tr("无法启动 git，请确认已安装并加入 PATH"), "error")
 
     def _on_push_finished(self, remote: RemoteBranch, code: int):
         detail = self._detail
@@ -1904,14 +1971,16 @@ class RepoPage(QWidget):
         self._proc = None
 
         if code == 0:
-            detail.set_status(f"推送成功，{remote.remote}/{detail.repo.branch} 已更新", "success")
+            detail.set_status(tr("推送成功，{remote}/{branch} 已更新",
+                                 remote=remote.remote, branch=detail.repo.branch),
+                              "success")
             QTimer.singleShot(1400, lambda: self._finish_push(detail))
             return
 
         detail.set_busy(False)
         self._set_rows_locked(False)
         reason = _brief_error(out + "\n" + err)
-        detail.set_status(f"推送失败：{reason}", "error")
+        detail.set_status(tr("推送失败：{reason}", reason=reason), "error")
 
     def _finish_push(self, detail: DetailPanel):
         if self._detail is not detail:
@@ -1954,7 +2023,7 @@ def _brief_error(text: str) -> str:
         low = ln.lower()
         if low.startswith(("fatal:", "error:", "remote:", "!")):
             return ln[:90]
-    return (lines[-1] if lines else "未知错误")[:90]
+    return (lines[-1] if lines else tr("未知错误"))[:90]
 
 
 class SourceRow(QWidget):
@@ -1962,6 +2031,7 @@ class SourceRow(QWidget):
 
     remove_requested = Signal(str, str)   # (path, kind)
     toggle_requested = Signal(str, str)   # (path, kind) 目录来源的展开/收起
+    open_requested = Signal(str)          # 单个仓库来源：点击进入仓库详情
 
     H = 58
 
@@ -1982,9 +2052,13 @@ class SourceRow(QWidget):
     def _has_toggle(self) -> bool:
         return self.kind == "folder" and bool(self.count)
 
+    def _clickable(self) -> bool:
+        """目录行点击展开/收起，单个仓库行点击进入详情。"""
+        return self.kind == "repo" or self._has_toggle()
+
     def mouseMoveEvent(self, e):
         hot_remove = self._remove_rect().contains(e.position())
-        hot_row = self._has_toggle() and not hot_remove
+        hot_row = self._clickable() and not hot_remove
         if (hot_remove, hot_row) != (self._hot_remove, self._hot_row):
             self._hot_remove, self._hot_row = hot_remove, hot_row
             self.setCursor(Qt.PointingHandCursor if (hot_remove or hot_row)
@@ -2003,6 +2077,8 @@ class SourceRow(QWidget):
         if e.button() == Qt.LeftButton:
             if self._remove_rect().contains(e.position()):
                 self.remove_requested.emit(self.path, self.kind)
+            elif self.kind == "repo":
+                self.open_requested.emit(self.path)
             elif self._has_toggle():
                 # 整行都是展开/收起的点击区，不再单独设按钮
                 self.toggle_requested.emit(self.path, self.kind)
@@ -2033,7 +2109,7 @@ class SourceRow(QWidget):
         p.setFont(f)
         p.setPen(accent)
         p.drawText(QRectF(bx, by, badge_w, badge_h), Qt.AlignCenter,
-                   "仓库" if self.kind == "repo" else "目录")
+                   tr("仓库") if self.kind == "repo" else tr("目录"))
 
         name = Path(self.path).name or self.path
         text_x = bx + badge_w + 14
@@ -2053,7 +2129,8 @@ class SourceRow(QWidget):
         p.drawText(QRectF(text_x, 29, path_w, 16), Qt.AlignVCenter | Qt.AlignLeft,
                    _elide(p, self.path, path_w))
         if self.kind == "folder":
-            label = "扫描中…" if self.count is None else f"{self.count} 个仓库"
+            label = tr("扫描中…") if self.count is None \
+                else tr("{n} 个仓库", n=self.count)
             p.drawText(QRectF(text_x + path_w, 29, 76, 16),
                        Qt.AlignVCenter | Qt.AlignRight, label)
 
@@ -2077,34 +2154,60 @@ class SourceRow(QWidget):
 class SourceRepoRow(QWidget):
     """目录来源下的二级条目：树形引导线 + 仓库名 + 分支 + 推送状态。"""
 
+    clicked = Signal(object)   # RepoInfo：点击进入仓库详情
+
     H = 40
 
     def __init__(self, repo: RepoInfo, parent=None):
         super().__init__(parent)
         self.repo = repo
+        self._hot = False
         self.setFixedHeight(self.H)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tr("打开仓库详情：配置远程、推送与拉取"))
+
+    def enterEvent(self, e):
+        self._hot = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hot = False
+        self.update()
+        super().leaveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit(self.repo)
+        super().mouseReleaseEvent(e)
 
     def _status(self, dark) -> tuple[str, QColor]:
         """汇总各远程的状态，用一行文案表示。"""
         if not self.repo.remotes:
-            return "未配置远程", theme.st("sub_text", dark)
+            return tr("未配置远程"), theme.st("sub_text", dark)
         ahead = max((r.ahead for r in self.repo.remotes), default=0)
         behind = max((r.behind for r in self.repo.remotes), default=0)
         if any(not r.exists for r in self.repo.remotes):
-            return "未推送", _ORANGE
+            return tr("未推送"), _ORANGE
         if ahead and behind:
             return f"↑{ahead} ↓{behind}", _GREEN
         if ahead:
             return f"↑{ahead}", _GREEN
         if behind:
             return f"↓{behind}", _ORANGE
-        return "已同步", _GREEN
+        return tr("已同步"), _GREEN
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         dark = _is_dark(self)
         w, h = self.width(), self.height()
+
+        if self._hot:
+            p.setPen(Qt.NoPen)
+            p.setBrush(theme.st("nav_hover", dark))
+            p.drawRect(0, 0, w, h)
 
         # 树形引导线：与父级徽标的中心对齐
         guide = theme.st("panel_border", dark)
@@ -2192,12 +2295,14 @@ class OverlayScrollBar(QScrollBar):
 class SourcesPage(QWidget):
     """仓库页：登记单个仓库目录，或添加整个文件夹自动扫描，可添加多个。"""
 
+    open_repo_requested = Signal(object)   # RepoInfo：进入仓库详情页
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.add_repo_btn = PillButton("添加仓库", self)
+        self.add_repo_btn = PillButton(tr("添加仓库"), self)
         self.add_repo_btn.clicked.connect(self._add_repo)
-        self.add_dir_btn = PillButton("添加文件夹", self)
+        self.add_dir_btn = PillButton(tr("添加文件夹"), self)
         self.add_dir_btn.clicked.connect(self._add_dir)
 
         self.scroll = QScrollArea(self)
@@ -2210,9 +2315,10 @@ class SourcesPage(QWidget):
         self._vbar = OverlayScrollBar(self.scroll)
         self.scroll.installEventFilter(self)
 
-        self.empty = EmptyState(self, "添加文件夹")
+        self.empty = EmptyState(self, tr("添加文件夹"))
         self.empty.btn.clicked.connect(self._add_dir)
-        self.empty.set_text("还没有添加仓库", "添加单个仓库目录，或添加整个文件夹后自动扫描")
+        self.empty.set_text(tr("还没有添加仓库"),
+                            tr("添加单个仓库目录，或添加整个文件夹后自动扫描"))
 
         self._holder: QWidget | None = None
         self._last_dir = str(Path.home())
@@ -2241,17 +2347,43 @@ class SourcesPage(QWidget):
     def _on_scan_done(self, _repos):
         self._rebuild()
 
+    def _open_by_path(self, path: str):
+        """单个仓库来源：优先复用扫描结果，取不到就让详情页自己读。"""
+        repo = next((r for r in scan_service().repos() if r.path == path), None)
+        self.open_repo_requested.emit(repo if repo is not None else path)
+
     def _panel_rect(self) -> QRect:
         return QRect(30, _PANEL_TOP, max(0, self.width() - 60),
                      max(0, self.height() - _PANEL_TOP - 28))
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
+    def _place_buttons(self):
+        """按当前按钮宽度靠右排列（语言切换后按钮宽度会变化）。"""
         panel = self._panel_rect()
         self.add_dir_btn.move(panel.right() - self.add_dir_btn.width() - 14,
                               panel.top() + 7)
         self.add_repo_btn.move(self.add_dir_btn.x() - self.add_repo_btn.width() - 8,
                                self.add_dir_btn.y())
+
+    def retranslate(self):
+        """热切换语言后刷新按钮、空状态、来源行与提示。"""
+        self.add_repo_btn.set_text(tr("添加仓库"))
+        self.add_dir_btn.set_text(tr("添加文件夹"))
+        self._place_buttons()
+        self.empty.set_button_text(tr("添加文件夹"))
+        self.empty.set_text(tr("还没有添加仓库"),
+                            tr("添加单个仓库目录，或添加整个文件夹后自动扫描"))
+        if self._holder is not None:
+            for row in self._holder.findChildren(SourceRepoRow):
+                row.setToolTip(tr("打开仓库详情：配置远程、推送与拉取"))
+                row.update()
+            for row in self._holder.findChildren(SourceRow):
+                row.update()
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_buttons()
+        panel = self._panel_rect()
         body = QRect(panel.left() + 1, panel.top() + _BAR_H,
                      panel.width() - 2, panel.height() - _BAR_H - 1)
         self.scroll.setGeometry(body)
@@ -2271,14 +2403,15 @@ class SourcesPage(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "仓库")
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, tr("仓库"), w))
 
         f.setPointSize(_SUB_PT)
         f.setBold(False)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
-                   "添加单独的仓库或整个目录，推送页会汇总显示其中的所有仓库")
+                   _elide(p, tr("添加单独的仓库或整个目录，推送页会汇总显示其中的所有仓库"), w))
 
         panel = self._panel_rect()
         r = theme.st("panel_radius", dark)
@@ -2288,11 +2421,11 @@ class SourcesPage(QWidget):
 
         sources = store.repo_sources()
         if sources and scan_service().scanning():
-            bar_text = f"正在扫描 · 已添加 {len(sources)} 项"
+            bar_text = tr("正在扫描 · 已添加 {n} 项", n=len(sources))
         elif sources:
-            bar_text = f"已添加 {len(sources)} 项"
+            bar_text = tr("已添加 {n} 项", n=len(sources))
         else:
-            bar_text = "尚未添加仓库或目录"
+            bar_text = tr("尚未添加仓库或目录")
         f.setPointSize(8)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
@@ -2333,13 +2466,13 @@ class SourcesPage(QWidget):
 
     # ---------- 来源增删 ----------
     def _add_repo(self):
-        picked = QFileDialog.getExistingDirectory(self, "选择仓库根目录", self._last_dir)
+        picked = QFileDialog.getExistingDirectory(self, tr("选择仓库根目录"), self._last_dir)
         if not picked:
             return
         if gitrepo.read_repo(Path(picked)) is None:
             QMessageBox.information(
-                self, "不是 Git 仓库",
-                "所选目录没有检测到 Git 仓库。\n请选择仓库根目录，或改用「添加文件夹」。")
+                self, tr("不是 Git 仓库"),
+                tr("所选目录没有检测到 Git 仓库。\n请选择仓库根目录，或改用「添加文件夹」。"))
             return
         self._last_dir = picked
         if add_source(picked, "repo"):
@@ -2347,7 +2480,7 @@ class SourcesPage(QWidget):
             self._rebuild()
 
     def _add_dir(self):
-        picked = QFileDialog.getExistingDirectory(self, "选择要扫描的文件夹", self._last_dir)
+        picked = QFileDialog.getExistingDirectory(self, tr("选择要扫描的文件夹"), self._last_dir)
         if not picked:
             return
         self._last_dir = picked
@@ -2473,7 +2606,9 @@ class SourcesPage(QWidget):
                 bl.setContentsMargins(0, 0, 0, 0)
                 bl.setSpacing(0)
                 for repo in children:
-                    bl.addWidget(SourceRepoRow(repo, box))
+                    child = SourceRepoRow(repo, box)
+                    child.clicked.connect(self.open_repo_requested)
+                    bl.addWidget(child)
                 if expanded:
                     box.setMaximumHeight(_BOX_MAX)
                 else:
@@ -2487,6 +2622,7 @@ class SourcesPage(QWidget):
                 lay.addWidget(row)
             row.remove_requested.connect(self._remove)
             row.toggle_requested.connect(self._toggle)
+            row.open_requested.connect(self._open_by_path)
         lay.addStretch(1)
 
         self.scroll.setWidget(holder)
@@ -2509,6 +2645,15 @@ class HomePage(QWidget):
         self._sources: list[dict] = []
         self._repos: list[RepoInfo] = []
         self._scanning = False
+        self._user_config: dict[str, str] = {}
+        self._hover_key = ""
+        self._editor: QLineEdit | None = None
+        self._editor_key = ""
+        self._notice: tuple[str, QColor] | None = None
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(self._clear_notice)
+        self.setMouseTracking(True)
         # 与推送页共用同一次扫描，切页不会重复跑 git
         scan_service().finished.connect(self._on_scan_done)
         scan_service().changed.connect(self._on_scan_done)
@@ -2536,6 +2681,7 @@ class HomePage(QWidget):
     def _refresh(self):
         svc = scan_service()
         self._sources = store.repo_sources()
+        self._user_config = gitrepo.global_config()
         if svc.ensure():
             self._repos = svc.repos()
             self._scanning = False
@@ -2562,26 +2708,27 @@ class HomePage(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(theme.st("title_text", dark))
-        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft, "首页")
+        p.drawText(QRectF(left, top, w, 30), Qt.AlignVCenter | Qt.AlignLeft,
+                   _elide(p, tr("首页"), w))
 
         f.setPointSize(_SUB_PT)
         f.setBold(False)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(left, top + 34, w, 22), Qt.AlignVCenter | Qt.AlignLeft,
-                   "仓库总览：数量、待推送与本地/远程状态")
+                   _elide(p, tr("仓库总览：数量、待推送与本地/远程状态"), w))
 
         total, pending, diverge, no_remote = self._metrics()
         dash = self._scanning and not self._repos
         cards = [
-            ("仓库总数", "—" if dash else str(total)),
-            ("待推送", "—" if dash else str(pending)),
-            ("本地/远程不一致", "—" if dash else str(diverge)),
-            ("未配置远程", "—" if dash else str(no_remote)),
+            (tr("仓库总数"), "—" if dash else str(total)),
+            (tr("待推送"), "—" if dash else str(pending)),
+            (tr("本地/远程不一致"), "—" if dash else str(diverge)),
+            (tr("未配置远程"), "—" if dash else str(no_remote)),
         ]
 
         r = theme.st("panel_radius", dark)
-        for rect, (label, value) in zip(self._card_rects(), cards):
+        for idx, (rect, (label, value)) in enumerate(zip(self._card_rects(), cards)):
             p.setPen(QPen(theme.st("panel_border", dark), 1))
             p.setBrush(theme.st("panel_bg", dark))
             p.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), r, r)
@@ -2597,22 +2744,227 @@ class HomePage(QWidget):
             vf.setPointSize(24)
             vf.setBold(True)
             p.setFont(vf)
-            p.setPen(theme.st("accent", dark) if label != "仓库总数"
+            p.setPen(theme.st("accent", dark) if idx
                      else theme.st("title_text", dark))
             p.drawText(QRectF(rect.left() + 16, rect.top() + 40, rect.width() - 32, 42),
                        Qt.AlignLeft | Qt.AlignVCenter, value)
 
         # 卡片下方的状态行
         if not self._sources:
-            status = "还没有添加仓库，到「仓库」页添加仓库或文件夹"
+            status = tr("还没有添加仓库，到「仓库」页添加仓库或文件夹")
         elif self._scanning:
-            status = f"正在扫描 {len(self._sources)} 个来源…"
+            status = tr("正在扫描 {n} 个来源…", n=len(self._sources))
         else:
-            status = f"{len(self._sources)} 个来源 · 共 {total} 个仓库"
+            status = tr("{sources} 个来源 · 共 {repos} 个仓库",
+                        sources=len(self._sources), repos=total)
         y = self._card_rects()[0].bottom() + 18
         f.setPointSize(9)
         f.setBold(False)
         p.setFont(f)
         p.setPen(theme.st("sub_text", dark))
         p.drawText(QRectF(left, y, w, 20), Qt.AlignLeft | Qt.AlignVCenter, status)
+
+        # 下方用户配置区：点击行内数值可直接修改全局 git 身份
+        self._paint_user_config(p, dark)
         p.end()
+
+    def _user_panel_rect(self) -> QRectF:
+        """用户配置面板：固定在统计卡片下方，高度随条目数收缩。"""
+        left, top = 30, 252
+        height = 42 + _USER_ROW_H * len(_USER_FIELDS) + 32
+        avail = self.height() - top - 30
+        return QRectF(left, top, max(0, self.width() - 60),
+                      max(0.0, min(height, avail)))
+
+    def _user_rows(self) -> list[tuple[str, str, QRectF, QRectF]]:
+        """返回 (键, 标题, 整行矩形, 数值矩形)，绘制与命中测试共用。"""
+        rect = self._user_panel_rect()
+        top = rect.top() + 42
+        avail = max(0.0, rect.bottom() - 32 - top)
+        row_h = min(float(_USER_ROW_H), avail / len(_USER_FIELDS))
+        rows = []
+        y = top
+        for title, key in _USER_FIELDS:
+            rows.append((
+                key, title,
+                QRectF(rect.left() + 10, y, rect.width() - 20, row_h),
+                QRectF(rect.left() + 120, y, rect.width() - 144, row_h),
+            ))
+            y += row_h
+        return rows
+
+    def _paint_user_config(self, p: QPainter, dark: bool):
+        """首页「用户配置」面板：读取自 git config --global，点击可修改。"""
+        rect = self._user_panel_rect()
+        if rect.height() < 90:
+            return
+        pr = theme.st("panel_radius", dark)
+        p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.setBrush(theme.st("panel_bg", dark))
+        p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), pr, pr)
+
+        hf = QFont(self.font())
+        hf.setPointSize(11)
+        hf.setBold(True)
+        p.setFont(hf)
+        p.setPen(theme.st("title_text", dark))
+        p.drawText(QRectF(rect.left() + 18, rect.top() + 10, rect.width() - 36, 24),
+                   Qt.AlignLeft | Qt.AlignVCenter, tr("用户配置"))
+
+        sf = QFont(self.font())
+        sf.setPointSize(9)
+        p.setFont(sf)
+        p.setPen(theme.st("placeholder", dark))
+        p.drawText(QRectF(rect.left() + 18, rect.top() + 10, rect.width() - 36, 24),
+                   Qt.AlignRight | Qt.AlignVCenter, tr("点击数值即可修改"))
+
+        line_y = rect.top() + 42
+        p.setPen(QPen(theme.st("panel_border", dark), 1))
+        p.drawLine(QPointF(rect.left() + 18, line_y),
+                   QPointF(rect.right() - 18, line_y))
+
+        lf = QFont(self.font())
+        lf.setPointSize(9)
+        vf = QFont(self.font())
+        vf.setPointSize(10)
+        for key, title, row_rect, value_rect in self._user_rows():
+            if key == self._hover_key and key != self._editor_key:
+                p.setPen(Qt.NoPen)
+                p.setBrush(theme.st("nav_hover", dark))
+                p.drawRoundedRect(row_rect, theme.st("pill_radius", dark),
+                                  theme.st("pill_radius", dark))
+            p.setFont(lf)
+            p.setPen(theme.st("sub_text", dark))
+            p.drawText(QRectF(row_rect.left() + 14, row_rect.top(), 96,
+                              row_rect.height()),
+                       Qt.AlignLeft | Qt.AlignVCenter, tr(title))
+            if key == self._editor_key:
+                continue
+            raw = self._user_config.get(key)
+            p.setFont(vf)
+            p.setPen(theme.st("placeholder", dark) if not raw
+                     else theme.st("title_text", dark))
+            text = QFontMetrics(vf).elidedText(
+                raw or tr("未配置"), Qt.ElideRight, int(value_rect.width()))
+            p.drawText(value_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+
+        if self._notice is not None:
+            hint, color = self._notice
+        else:
+            hint = tr("修改后写入全局配置：git config --global <键> <值>")
+            color = theme.st("placeholder", dark)
+        hint_rect = QRectF(rect.left() + 18, rect.bottom() - 30,
+                           rect.width() - 36, 20)
+        p.setFont(sf)
+        p.setPen(color)
+        hint = QFontMetrics(sf).elidedText(hint, Qt.ElideRight,
+                                           int(hint_rect.width()))
+        p.drawText(hint_rect, Qt.AlignLeft | Qt.AlignVCenter, hint)
+
+    def _row_at(self, pos: QPointF) -> str:
+        for key, _, row_rect, _ in self._user_rows():
+            if row_rect.contains(pos):
+                return key
+        return ""
+
+    def mouseMoveEvent(self, e):
+        key = self._row_at(e.position())
+        if key != self._hover_key:
+            self._hover_key = key
+            self.setCursor(Qt.PointingHandCursor if key else Qt.ArrowCursor)
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            # 点在编辑框之外时先提交，等同按一次回车（含点空白处与点另一行）
+            if self._editor is not None and \
+                    not self._editor.geometry().contains(e.position().toPoint()):
+                self._commit_edit()
+            key = self._row_at(e.position())
+            if key:
+                self._start_edit(key)
+                return
+        super().mousePressEvent(e)
+
+    def _start_edit(self, key: str):
+        """在数值位置浮出输入框：回车或失焦保存，Esc 取消。"""
+        self._close_editor()
+        value_rect = next(r for k, _, _, r in self._user_rows() if k == key)
+        dark = _is_dark(self)
+        ed = QLineEdit(self)
+        f = QFont(self.font())
+        f.setPointSize(10)
+        ed.setFont(f)
+        ed.setGeometry(value_rect.toRect().adjusted(-6, 4, 6, -4))
+        ed.setText(self._user_config.get(key, ""))
+        ed.setStyleSheet(
+            "QLineEdit {"
+            f" background: {theme.st('panel_bg', dark).name()};"
+            f" color: {theme.st('title_text', dark).name()};"
+            f" border: 1px solid {theme.st('accent', dark).name()};"
+            " border-radius: 6px; padding: 0 6px; }")
+        ed.installEventFilter(self)
+        ed.editingFinished.connect(self._commit_edit)
+        ed.selectAll()
+        ed.show()
+        ed.setFocus()
+        self._editor, self._editor_key = ed, key
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if (obj is self._editor and event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Escape):
+            self._close_editor()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _commit_edit(self):
+        ed, key = self._editor, self._editor_key
+        if ed is None:
+            return
+        text = ed.text().strip()
+        old = self._user_config.get(key, "")
+        self._close_editor()
+        if not text:
+            self._show_notice(tr("内容不能为空，未修改"), _RED)
+            return
+        if text == old:
+            return
+        if gitrepo.set_global_config(key, text):
+            self._user_config[key] = text
+            self._show_notice(tr("已保存"), _GREEN)
+        else:
+            self._show_notice(tr("保存失败，请检查 git 是否可用"), _RED)
+
+    def _close_editor(self):
+        ed = self._editor
+        self._editor = None
+        self._editor_key = ""
+        if ed is None:
+            return
+        ed.blockSignals(True)
+        ed.removeEventFilter(self)
+        ed.hide()
+        ed.deleteLater()
+        self.update()
+
+    def _show_notice(self, text: str, color: QColor):
+        self._notice = (text, color)
+        self._notice_timer.start(2600)
+        self.update()
+
+    def _clear_notice(self):
+        self._notice = None
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._editor is None:
+            return
+        rect = next((r for k, _, _, r in self._user_rows()
+                     if k == self._editor_key), None)
+        if rect is None:
+            self._close_editor()
+        else:
+            self._editor.setGeometry(rect.toRect().adjusted(-6, 4, 6, -4))
