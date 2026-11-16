@@ -54,11 +54,10 @@ jobs:
 
       - name: Nuitka 打包（目录版）
         shell: pwsh
-        working-directory: nuitka
         run: |
           $ver = $env:VERSION
           $na = @(
-            '-u', '-m', 'nuitka',
+            '-m', 'nuitka',
             '--standalone',
             '--assume-yes-for-downloads',
             '--windows-console-mode=disable',
@@ -68,20 +67,19 @@ jobs:
             '--enable-plugin=pyside6',
             '--include-package=winrt',
             '--include-package-data=winrt',
+            '--msvc=latest',
+            '--jobs=4',
+            '--remove-output',
             '--output-dir=.\dist',
-            '--windows-icon-from-ico=..\icon.ico',
-            '--include-data-file=..\icon.ico=icon.ico',
+            '--windows-icon-from-ico=icon.ico',
+            '--include-data-file=icon.ico=icon.ico',
+            '--company-name=Lisselde_E',
             '--product-name=GiTool',
             '--file-description=GiTool',
             "--product-version=$ver",
             "--file-version=$ver",
             '--copyright=Copyright (c) 2026 Lisselde_E',
-            '--remove-output',
-            '--show-progress',
-            '--show-memory',
-            '--jobs=4',
-            '--zig',
-            '..\GiTool.py'
+            '.\GiTool.py'
           )
           python @na
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -92,8 +90,8 @@ jobs:
           $iscc = $env:ISCC
           & $iscc /Qp `
             "/DMyAppVersion=$env:VERSION" `
-            "/DMyAppSrcDir=$env:GITHUB_WORKSPACE\nuitka\dist\GiTool.dist" `
-            "/DMyOutputDir=$env:GITHUB_WORKSPACE\nuitka\dist" `
+            "/DMyAppSrcDir=$env:GITHUB_WORKSPACE\dist\GiTool.dist" `
+            "/DMyOutputDir=$env:GITHUB_WORKSPACE\dist" `
             "/DMyLicenseFile=$env:GITHUB_WORKSPACE\LICENSE" `
             "/DMySetupIcon=$env:GITHUB_WORKSPACE\icon.ico" `
             ".github\ci\windows\gitool_setup.iss"
@@ -102,7 +100,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: nuitka/dist/${{ env.WIN_ASSET }}
+          path: dist/${{ env.WIN_ASSET }}
           if-no-files-found: error
 
   release:
