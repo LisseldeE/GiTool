@@ -4,6 +4,10 @@ GiTool is a Git helper for Windows: it keeps repositories scattered across many 
 
 The interface is fully custom-drawn with PySide6, and supports both macOS-style and Win11-native window styles, light/dark themes, and optional system identity verification.
 
+<p align="center">
+  <img src="https://lisseldee.github.io/assets/images/webp/9-1.webp" width="100%" alt="LANSyncBox">
+</p>
+
 ## Project Information
 
 - **Project Name**: GiTool

@@ -25,6 +25,7 @@ from typing import Callable, List, Optional
 
 from . import store
 from .config import Config
+from .i18n import language as ui_language
 from .i18n import tr
 
 CHUNK_SIZE = 1024 * 1024  # 下载分块 1MB
@@ -49,9 +50,11 @@ class UpdateInfo:
         self.changelog = list(changelog or [])
         self.size = size
 
-    def download_url(self) -> str:
-        """中文地址优先，缺失时回退英文地址。"""
-        return self.url_zh_cn or self.url_en_us
+    def url_for(self, language: str) -> str:
+        """按界面语言选下载地址（中文优先中文地址，其余走英文地址）。"""
+        if str(language or "").lower().startswith("zh"):
+            return self.url_zh_cn or self.url_en_us
+        return self.url_en_us or self.url_zh_cn
 
     def __repr__(self):
         return f"UpdateInfo({self.version!r})"
@@ -168,7 +171,7 @@ def download_package(info: UpdateInfo,
     置位后抛 UpdateError（已下载部分保留为 .part，供下次续传）。
     on_verify()：字节下载完成、开始 sha256 校验前回调，供界面切换提示。
     """
-    url = info.download_url()
+    url = info.url_for(ui_language())
     if not url:
         raise UpdateError(tr("更新清单未提供下载地址"))
     if not _SHA256_RE.fullmatch(info.sha256):

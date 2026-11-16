@@ -4,6 +4,10 @@ GiTool 是一款面向 Windows 的 Git 辅助工具：把分散在多个目录�
 
 界面使用 PySide6 完全自绘，支持 macOS 与 Win11 两种窗口风格、深浅色主题，以及可选的系统身份校验。
 
+<p align="center">
+  <img src="https://lisseldee.github.io/assets/images/webp/9-1.webp" width="100%" alt="LANSyncBox">
+</p>
+
 ## 项目信息
 
 - **项目名称**：GiTool
